@@ -8,14 +8,16 @@ clip.
 Design conventions honored here:
   * The GPU models are obtained through :func:`emilia_pipeline.common.models.get_model`
     so unit tests run with deterministic mocks (zero GPU). CPU DSP is pure numpy.
-  * ALL metrics are computed and stored; the stage never hard-drops a row.
-    Pass/reject is a *query condition* -- exposed as the standalone
-    :func:`s1_pass` predicate (and mirrored into the advisory ``passed`` /
-    ``reject_reason`` columns for convenience). Threshold changes = re-run
-    :func:`s1_pass` over stored parquet, not the pipeline.
-  * Short-circuit rule (§4): S1's own metrics are always computed in full (for
-    ROC calibration / threshold replay); it is the *caller* (the fusion worker)
-    that skips S2/S3 when :func:`s1_pass` is False.
+  * Metrics are stored, never used to hard-drop a row. Pass/reject is a *query
+    condition* -- exposed as the standalone :func:`s1_pass` predicate (and
+    mirrored into the advisory ``passed`` / ``reject_reason`` columns for
+    convenience). Threshold changes = re-run :func:`s1_pass` over stored
+    parquet, not the pipeline.
+  * Short-circuit rules: the *caller* (the fusion worker) skips S2/S3 when
+    :func:`s1_pass` is False. Within S1 itself, DNSMOS -- the expensive serial
+    CPU model -- only runs on clips passing every other gate (pilot-measured
+    marginal rejection ~2%); skipped clips store ``None`` in ``dnsmos_*``. All
+    cheap metrics are still computed in full for ROC calibration.
 
 Public surface:
   * :func:`compute_cpu_metrics` -- SNR / clipping / bandwidth for one clip.
@@ -288,7 +290,10 @@ def s1_reject_reason(row: RowLike, config: Config) -> str | None:
         reasons.append(f"aes_pq<{s1.min_aes_pq}")
     if float(_get(row, "aes_pc")) > s1.max_aes_pc:
         reasons.append(f"aes_pc>{s1.max_aes_pc}")
-    if float(_get(row, "dnsmos_ovrl")) < s1.min_dnsmos_ovrl:
+    # None == DNSMOS skipped by the in-stage short-circuit (another gate already
+    # failed); the gate is simply not evaluated then.
+    dnsmos_ovrl = _get(row, "dnsmos_ovrl")
+    if dnsmos_ovrl is not None and float(dnsmos_ovrl) < s1.min_dnsmos_ovrl:
         reasons.append(f"dnsmos_ovrl<{s1.min_dnsmos_ovrl}")
     if float(_get(row, "snr_db")) < s1.min_snr_db:
         reasons.append(f"snr_db<{s1.min_snr_db}")
@@ -327,10 +332,13 @@ def compute_s1_rows(
 ) -> list[S1AcousticsRow]:
     """Compute S1 rows for a batch of decoded clips.
 
-    GPU inference runs once per model over the whole batch (aesthetics, then
-    DNSMOS); CPU metrics are computed per clip. Every metric is stored on the
-    row, and the advisory ``passed`` / ``reject_reason`` columns are filled from
-    :func:`s1_pass`. No row is dropped here.
+    Aesthetics runs once over the whole batch; DNSMOS (the expensive serial CPU
+    model) is short-circuited: it only runs on clips that already pass every
+    *other* gate (aes_pq / aes_pc / snr / clipping / bandwidth), since a clip
+    rejected by a cheap gate is rejected regardless of its DNSMOS score. Skipped
+    clips store ``None`` in the ``dnsmos_*`` columns; every ``passed`` row always
+    carries real DNSMOS values, so the marginal-rejection calibration query
+    ("PQ 过但 OVRL 拒") stays answerable. No row is dropped here.
 
     Args:
         clips: Sequence of ``(clip_id, samples, sample_rate)`` tuples. Samples
@@ -358,10 +366,12 @@ def compute_s1_rows(
 
     batch: list[tuple[np.ndarray, int]] = [(arr, sr) for _, arr, sr in clips]
     aes_out = models.aesthetics.predict(batch)
-    dns_out = models.dnsmos.predict(batch)
 
-    rows: list[S1AcousticsRow] = []
-    for i, ((clip_id, arr, sr), aes, dns) in enumerate(zip(clips, aes_out, dns_out)):
+    # Pass 1: everything except DNSMOS. Clips whose cheap gates all pass are
+    # DNSMOS candidates; the rest are rejected without paying for DNSMOS.
+    partial: list[dict[str, Any]] = []
+    candidates: list[int] = []
+    for i, ((clip_id, arr, sr), aes) in enumerate(zip(clips, aes_out)):
         cpu = cpu_metrics[i] if cpu_metrics is not None else compute_cpu_metrics(arr, sr)
         metrics: dict[str, Any] = {
             "clip_id": clip_id,
@@ -370,19 +380,32 @@ def compute_s1_rows(
             "aes_pc": float(aes["aes_pc"]),
             "aes_ce": float(aes["aes_ce"]),
             "aes_cu": float(aes["aes_cu"]),
-            "dnsmos_sig": float(dns["dnsmos_sig"]),
-            "dnsmos_bak": float(dns["dnsmos_bak"]),
-            "dnsmos_ovrl": float(dns["dnsmos_ovrl"]),
+            "dnsmos_sig": None,
+            "dnsmos_bak": None,
+            "dnsmos_ovrl": None,
             "snr_db": cpu["snr_db"],
             "clipping_ratio": cpu["clipping_ratio"],
             "bandwidth_hz": cpu["bandwidth_hz"],
             "loudness_lufs": float(cpu.get("loudness_lufs", 0.0)),
         }
+        partial.append(metrics)
+        if s1_reject_reason(metrics, config) is None:
+            candidates.append(i)
+
+    # Pass 2: DNSMOS only on the candidates.
+    if candidates:
+        dns_out = models.dnsmos.predict([batch[i] for i in candidates])
+        for i, dns in zip(candidates, dns_out):
+            partial[i]["dnsmos_sig"] = float(dns["dnsmos_sig"])
+            partial[i]["dnsmos_bak"] = float(dns["dnsmos_bak"])
+            partial[i]["dnsmos_ovrl"] = float(dns["dnsmos_ovrl"])
+
+    rows: list[S1AcousticsRow] = []
+    for metrics in partial:
         reason = s1_reject_reason(metrics, config)
-        row = S1AcousticsRow(
-            **metrics, passed=(reason is None), reject_reason=reason
+        rows.append(
+            S1AcousticsRow(**metrics, passed=(reason is None), reject_reason=reason)
         )
-        rows.append(row)
     return rows
 
 

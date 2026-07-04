@@ -231,10 +231,12 @@ class S1AcousticsRow(_Base):
     aes_pc: float
     aes_ce: float
     aes_cu: float
-    # DNSMOS P.835.
-    dnsmos_sig: float
-    dnsmos_bak: float
-    dnsmos_ovrl: float
+    # DNSMOS P.835. None == skipped by the in-stage short-circuit: DNSMOS only
+    # runs on clips that already pass every other S1 gate (it is the expensive
+    # serial CPU model). A ``passed`` row always carries real values.
+    dnsmos_sig: Optional[float] = None
+    dnsmos_bak: Optional[float] = None
+    dnsmos_ovrl: Optional[float] = None
     # CPU metrics.
     snr_db: float
     clipping_ratio: float

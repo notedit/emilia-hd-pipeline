@@ -229,6 +229,11 @@ class RealAestheticsModel(BaseAudioModel):
     name = MODEL_AESTHETICS
     is_mock = False
 
+    # The predictor pads every item in one forward to the longest clip, so a
+    # whole-shard batch (tens of thousands of clips) would try to materialize a
+    # single multi-TB tensor. Feed it fixed-size chunks instead.
+    _CHUNK = 32
+
     def __init__(self, checkpoint_pth: str) -> None:
         from audiobox_aesthetics.infer import initialize_predictor
 
@@ -237,23 +242,24 @@ class RealAestheticsModel(BaseAudioModel):
     def predict(self, batch: Sequence[tuple[np.ndarray, int]]) -> list[dict[str, Any]]:
         import torch
 
-        items = []
-        for arr, sr in batch:
-            wav = torch.as_tensor(np.ascontiguousarray(arr, dtype=np.float32))
-            if wav.ndim == 1:
-                wav = wav.unsqueeze(0)  # (C=1, T) as the predictor expects
-            items.append({"path": wav, "sample_rate": int(sr)})
-        raw = self._predictor.forward(items)
         out: list[dict[str, Any]] = []
-        for r in raw:
-            out.append(
-                {
-                    "aes_pq": float(r["PQ"]),
-                    "aes_pc": float(r["PC"]),
-                    "aes_ce": float(r["CE"]),
-                    "aes_cu": float(r["CU"]),
-                }
-            )
+        for start in range(0, len(batch), self._CHUNK):
+            items = []
+            for arr, sr in batch[start : start + self._CHUNK]:
+                wav = torch.as_tensor(np.ascontiguousarray(arr, dtype=np.float32))
+                if wav.ndim == 1:
+                    wav = wav.unsqueeze(0)  # (C=1, T) as the predictor expects
+                items.append({"path": wav, "sample_rate": int(sr)})
+            raw = self._predictor.forward(items)
+            for r in raw:
+                out.append(
+                    {
+                        "aes_pq": float(r["PQ"]),
+                        "aes_pc": float(r["PC"]),
+                        "aes_ce": float(r["CE"]),
+                        "aes_cu": float(r["CU"]),
+                    }
+                )
         return out
 
 

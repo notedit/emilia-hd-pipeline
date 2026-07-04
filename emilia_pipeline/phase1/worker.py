@@ -2,14 +2,20 @@
 
 Design §6.2. A single GPU worker (one process per ``CUDA_VISIBLE_DEVICES``)
 sequentially reads a source shard, runs the inline S0 metadata whitelist, then a
-CPU pool (``mp.Pool``, spawn, size ``total_cores // n_gpus``) that decodes each
-S0-surviving clip and computes S2 prosody DSP features + the S1 CPU metrics. The
-decoded audio is gathered back into the main process where the two GPU models
-(Audiobox-Aesthetics + DNSMOS) score the whole batch at once. ``s1_pass`` then
-short-circuits: clips that fail the strict acoustic gates keep their fully
-computed S1 metrics but are excluded from S2/S3 accounting. Finally CAM++ runs a
-sliding-window purity pass over the S1-surviving clips only, verdicts are
-decided, and every stage's rows are buffered and written *once* at shard end:
+CPU pool (``mp.Pool``, spawn, size ``total_cores // n_gpus``) in two passes
+around the S1 gate:
+
+  * pass A (all S0 survivors): decode + cheap S1 CPU metrics. The decoded audio
+    is gathered back into the main process where Audiobox-Aesthetics scores the
+    whole batch; DNSMOS then runs only on clips passing every other S1 gate
+    (in-stage short-circuit, see :mod:`..stages.s1_acoustics`).
+  * pass B (S1 survivors only): S2 prosody DSP features (F0 / VAD / energy) on
+    the already-decoded audio. S1-failed clips never pay for F0 (design §4
+    short-circuit: "S1 fail 不算 S2/S3").
+
+Finally CAM++ runs a sliding-window purity pass over the S1-surviving clips
+only, verdicts are decided, and every stage's rows are buffered and written
+*once* at shard end:
 
     stage/s0_prefilter/part-{shard}.parquet      (all clips)
     stage/s1_acoustics/part-{shard}.parquet      (S0-pass clips)
@@ -92,13 +98,18 @@ class ClipInput:
 
 @dataclass
 class CpuResult:
-    """Output of the per-clip CPU stage (decode + S2 features + S1 CPU metrics)."""
+    """Output of the per-clip CPU pass A (decode + S1 CPU metrics).
+
+    S2 prosody features are deliberately NOT computed here: pass A runs on every
+    S0 survivor, but the design short-circuit (§4) says S1-failed clips must not
+    pay for S2. Features are computed in pass B (:func:`_s2_clip_task`) over the
+    S1 survivors only.
+    """
 
     clip_id: str
     audio: np.ndarray
     sr: int
     cpu_metrics: dict[str, float]
-    features: s2_prosody.ProsodyFeatures
 
 
 @dataclass
@@ -182,15 +193,27 @@ def _pool_init(config: Config) -> None:
 
 
 def _cpu_clip_task(item: tuple[int, str, bytes, str]) -> tuple[int, CpuResult]:
-    """Decode one clip and compute its S2 features + S1 CPU metrics.
+    """Pass A: decode one clip and compute its S1 CPU metrics.
 
     Runs inside a CPU-pool process (or inline). Returns the original index so the
     caller can restore input order regardless of completion order.
     """
-    index, clip_id, audio_bytes, text = item
-    config: Config = _WORKER_STATE["config"]
+    index, clip_id, audio_bytes, _text = item
     arr, sr = audio_utils.decode_bytes(audio_bytes)
     cpu_metrics = s1_acoustics.compute_cpu_metrics(arr, sr)
+    return index, CpuResult(clip_id=clip_id, audio=arr, sr=sr, cpu_metrics=cpu_metrics)
+
+
+def _s2_clip_task(
+    item: tuple[int, str, np.ndarray, int, str]
+) -> tuple[int, s2_prosody.ProsodyFeatures]:
+    """Pass B: compute S2 prosody features for one S1-surviving clip.
+
+    Receives the already-decoded audio (kept in memory from pass A for the GPU
+    batch), so no second decode is paid.
+    """
+    index, _clip_id, arr, sr, text = item
+    config: Config = _WORKER_STATE["config"]
     features = s2_prosody.extract_prosody_features(
         arr,
         sr,
@@ -199,9 +222,7 @@ def _cpu_clip_task(item: tuple[int, str, bytes, str]) -> tuple[int, CpuResult]:
         f0_tracker=_WORKER_STATE["f0"],
         vad=_WORKER_STATE["vad"],
     )
-    return index, CpuResult(
-        clip_id=clip_id, audio=arr, sr=sr, cpu_metrics=cpu_metrics, features=features
-    )
+    return index, features
 
 
 def _text_of(meta: Mapping[str, Any]) -> str:
@@ -213,17 +234,19 @@ def _text_of(meta: Mapping[str, Any]) -> str:
     return ""
 
 
-def _run_cpu_stage(
-    items: Sequence[tuple[int, str, bytes, str]],
+def _run_pool(
+    task: Any,
+    items: Sequence[Any],
     config: Config,
     *,
     parallel: bool,
-) -> list[CpuResult]:
-    """Map the CPU stage over ``items``, restoring input order.
+) -> list[Any]:
+    """Map an indexed pool task over ``items``, restoring input order.
 
-    Uses an ``mp.Pool`` (spawn context, size ``total_cores // n_gpus``) when
-    ``parallel`` and there is more than one item; otherwise runs inline (the
-    order-restoring, deterministic path used by unit tests).
+    ``task`` takes one item and returns ``(index, result)``. Uses an ``mp.Pool``
+    (spawn context, size ``total_cores // n_gpus``) when ``parallel`` and there
+    is more than one item; otherwise runs inline (the order-restoring,
+    deterministic path used by unit tests).
     """
     if not items:
         return []
@@ -231,7 +254,7 @@ def _run_cpu_stage(
     if not parallel or len(items) == 1 or pool_size == 1:
         _pool_init(config)
         try:
-            paired = [_cpu_clip_task(it) for it in items]
+            paired = [task(it) for it in items]
         finally:
             _WORKER_STATE.clear()
         paired.sort(key=lambda p: p[0])
@@ -242,9 +265,29 @@ def _run_cpu_stage(
     with ctx.Pool(
         processes=workers, initializer=_pool_init, initargs=(config,)
     ) as pool:
-        paired = list(pool.imap_unordered(_cpu_clip_task, items))
+        paired = list(pool.imap_unordered(task, items))
     paired.sort(key=lambda p: p[0])
     return [res for _, res in paired]
+
+
+def _run_cpu_stage(
+    items: Sequence[tuple[int, str, bytes, str]],
+    config: Config,
+    *,
+    parallel: bool,
+) -> list[CpuResult]:
+    """Pass A over S0 survivors: decode + S1 CPU metrics."""
+    return _run_pool(_cpu_clip_task, items, config, parallel=parallel)
+
+
+def _run_s2_stage(
+    items: Sequence[tuple[int, str, np.ndarray, int, str]],
+    config: Config,
+    *,
+    parallel: bool,
+) -> list[s2_prosody.ProsodyFeatures]:
+    """Pass B over S1 survivors: S2 prosody features (F0 / VAD / energy)."""
+    return _run_pool(_s2_clip_task, items, config, parallel=parallel)
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +379,8 @@ def run_shard(
     passed_by_id = {r.clip_id: r.passed for r in s0_rows}
     s0_pass_clips = [c for c in clips if passed_by_id.get(c.clip_id, False)]
 
-    # --- CPU pool: decode + S2 features + S1 CPU metrics for S0 survivors. ---
+    # --- CPU pool pass A: decode + S1 CPU metrics for S0 survivors. ---
+    text_by_id = {c.clip_id: _text_of(c.meta) for c in s0_pass_clips}
     cpu_items = [
         (i, c.clip_id, c.audio_bytes, _text_of(c.meta))
         for i, c in enumerate(s0_pass_clips)
@@ -361,9 +405,27 @@ def run_shard(
     finally:
         s1_models.close()
 
-    # --- s1_pass short-circuit: only survivors continue to S2/S3 accounting. ---
+    # --- s1_pass short-circuit: only survivors continue to S2/S3 (design §4:
+    # S1-failed clips never pay for F0/VAD/CAM++). ---
     cpu_by_id = {r.clip_id: r for r in cpu_results}
     s1_survivors = [r for r in s1_rows if r.passed]
+
+    # --- CPU pool pass B: S2 prosody features for S1 survivors only, on the
+    # audio already decoded in pass A. ---
+    s2_items = [
+        (
+            i,
+            r.clip_id,
+            cpu_by_id[r.clip_id].audio,
+            cpu_by_id[r.clip_id].sr,
+            text_by_id.get(r.clip_id, ""),
+        )
+        for i, r in enumerate(s1_survivors)
+    ]
+    s2_features = _run_s2_stage(s2_items, config, parallel=parallel)
+    feat_by_id = {
+        r.clip_id: feat for r, feat in zip(s1_survivors, s2_features)
+    }
 
     # --- S2: store RAW richness metrics only. prosody_dsp_score is a
     # population-wide z-score, so it is NOT computed per-shard here (that would
@@ -371,7 +433,7 @@ def run_shard(
     # DuckDB at repack / S5 time from these raw columns (design §4 S2). ---
     s2_rows: list[S2ProsodyRow] = []
     for s1_row in s1_survivors:
-        feat = cpu_by_id[s1_row.clip_id].features
+        feat = feat_by_id[s1_row.clip_id]
         s2_rows.append(
             S2ProsodyRow(
                 clip_id=s1_row.clip_id,
@@ -402,7 +464,7 @@ def run_shard(
                 _speaker_of(s0_rows, r.clip_id) for r in s1_survivors
             ]
             f0_confs = [
-                cpu_by_id[r.clip_id].features.f0_tracker_confidence
+                feat_by_id[r.clip_id].f0_tracker_confidence
                 for r in s1_survivors
             ]
             s3_results = s3_speaker.process_batch(

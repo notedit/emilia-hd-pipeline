@@ -47,7 +47,7 @@ from ..common.models import _seeded_rng, content_hash
 
 # --- DSP constants (module-level so tests / callers can reference them) -------
 
-# pyworld analysis frame period (ms); harvest default.
+# pyworld analysis frame period (ms).
 _F0_FRAME_PERIOD_MS = 5.0
 # semitone reference pitch (cancels out of std/range; only fixes f0_mean scaling).
 _SEMITONE_REF_HZ = 55.0
@@ -142,9 +142,21 @@ class BaseF0Tracker(abc.ABC):
 
 
 class PyworldF0Tracker(BaseF0Tracker):
-    """Real F0 tracker backed by pyworld harvest + stonemask (CPU)."""
+    """Real F0 tracker backed by pyworld dio + stonemask on a 16 kHz resample.
+
+    dio@16k is ~24x faster than harvest at native rate (pilot-measured on real
+    Emilia clips: 0.008x vs 0.192x realtime) at the cost of systematically lower
+    voiced-confidence estimates -- ``s3.f0_confidence_poor`` is calibrated for
+    dio's distribution, not harvest's. S2 is deliberately a *loose* richness
+    filter and the std/range metrics are population-z-scored downstream, so
+    dio's absolute bias washes out of the score.
+    """
 
     is_mock = False
+
+    # dio cost scales with sample rate (unlike harvest); f0_ceil 600 Hz sits far
+    # below the 8 kHz Nyquist, so tracking on a 16 kHz resample loses nothing.
+    _TRACK_SR = 16000
 
     def __init__(self, f0_floor_hz: float, f0_ceil_hz: float) -> None:
         self.f0_floor_hz = float(f0_floor_hz)
@@ -153,18 +165,21 @@ class PyworldF0Tracker(BaseF0Tracker):
     def track(self, audio: np.ndarray, sr: int) -> F0Track:
         import pyworld  # lazy; heavy native extension
 
-        x = np.ascontiguousarray(audio, dtype=np.float64)
-        if x.size == 0:
+        wav = np.asarray(audio, dtype=np.float32)
+        if wav.size == 0:
             return F0Track(f0_hz=np.zeros(0, dtype=np.float64))
-        f0, t = pyworld.harvest(
+        if sr != self._TRACK_SR:
+            wav = resample(wav, sr, self._TRACK_SR)
+        x = np.ascontiguousarray(wav, dtype=np.float64)
+        f0, t = pyworld.dio(
             x,
-            sr,
+            self._TRACK_SR,
             f0_floor=self.f0_floor_hz,
             f0_ceil=self.f0_ceil_hz,
             frame_period=_F0_FRAME_PERIOD_MS,
         )
-        # stonemask refines the harvest estimate.
-        f0 = pyworld.stonemask(x, f0, t, sr)
+        # stonemask refines the dio estimate.
+        f0 = pyworld.stonemask(x, f0, t, self._TRACK_SR)
         return F0Track(f0_hz=np.asarray(f0, dtype=np.float64), frame_period_ms=_F0_FRAME_PERIOD_MS)
 
 
