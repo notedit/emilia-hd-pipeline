@@ -8,23 +8,18 @@ Fully mock-based. Every GPU model and every network/API dependency sits behind a
 lazy factory with a deterministic MOCK fallback, so these tests need **zero GPU,
 zero API key, and zero real data**. This is what runs in CI and on any laptop.
 
-Files:
+Deliberately minimal (basic functional verification only):
 
-- `test_foundation.py`   — config load, contracts round-trip, flatten/unflatten, io_utils atomics.
-- `test_s3_speaker.py`   — S3 window geometry, verdict logic, trim path (mock CAM++).
-- `test_phase1_worker.py`— Phase-1 fused scan wiring (mock models, synthetic shard).
-- `test_phase2_s4.py`    — S4 client plumbing, guided-JSON schema, retry (MockS4Client).
-- `test_s5_scoring.py`   — S5 join/score/tier/meta and HF-pack scaffolding.
+- `test_basics.py`            — config load, Phase-1 worker core invariants on a
+  synthetic shard (row counts / done marker / DNSMOS short-circuit / idempotency),
+  S1 pass predicate.
+- `test_e2e_mock_pipeline.py` — full pipeline on one synthetic shard:
+  S0..S3 worker -> repack -> S4 (mock transport) -> S5 -> HF packaging -> monitor.
 
 Run it:
 
 ```bash
-# everything that is NOT an opt-in real-integration test
 pytest -m "not gpu and not api and not integration"
-
-# or simply target the unit files
-pytest tests/test_foundation.py tests/test_s3_speaker.py \
-       tests/test_phase1_worker.py tests/test_phase2_s4.py tests/test_s5_scoring.py
 ```
 
 ## 2. Real-integration tier (opt-in) — `tests/integration/`
