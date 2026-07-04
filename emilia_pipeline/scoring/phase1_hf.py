@@ -66,6 +66,8 @@ __all__ = [
     "attach_audio_from_source",
     "write_shards",
     "build_manifest_rows",
+    "write_metrics_parquet",
+    "upload_s4_labels",
     "package_phase1",
     "upload_phase1_to_hf",
 ]
@@ -89,6 +91,9 @@ class Phase1Entry:
     trim_end_s: Optional[float] = None
     audio_bytes: Optional[bytes] = None
     audio_ext: str = "flac"
+    # Flat survivor row (every queried metric column) for the top-level
+    # ``metadata/phase1_metrics.parquet`` -- the Phase-2 join surface.
+    metrics_row: Optional[dict[str, Any]] = None
 
     @property
     def has_audio(self) -> bool:
@@ -309,6 +314,7 @@ def load_phase1_entries(
                 trimmed=bool(row.get("trimmed", False)),
                 trim_start_s=_f(row.get("trim_start_s")),
                 trim_end_s=_f(row.get("trim_end_s")),
+                metrics_row=row,
             )
         )
     return entries
@@ -496,7 +502,7 @@ def _dataset_card(config: Config, result_n: int, n_audio: int) -> str:
     """Render a minimal dataset card (README.md) describing the filtered subset."""
     s0, s1 = config.s0, config.s1
     return f"""---
-license: other
+license: cc-by-nc-4.0
 task_categories:
   - text-to-speech
   - audio-classification
@@ -516,10 +522,17 @@ filtered** view: clips that survived the S0-S3 acoustic / prosody / speaker-puri
 funnel, **before** Phase-2 emotion labeling. The fully-labeled release lives in
 the same repo on a different revision.
 
+Derived from [amphion/Emilia-Dataset](https://huggingface.co/datasets/amphion/Emilia-Dataset)
+(CC-BY-NC-4.0); the same license and usage restrictions apply.
+
 - **Pipeline version:** `{config.version}` (schema `{config.schema_version}`)
 - **Clips:** {result_n} ({n_audio} with audio)
 - **Format:** WebDataset tar shards under `data/`; each clip is
   `{{clip_id}}.flac` + `{{clip_id}}.json`.
+- **Metadata:** `metadata/phase1_metrics.parquet` -- one flat row per clip
+  (full S0-S3 metrics, keyed by `clip_id`). Phase-2 emotion/prosody labels are
+  published incrementally as `metadata/s4_labels.parquet` with the same key;
+  audio tars are never rewritten.
 
 ## Filtering funnel
 
@@ -606,6 +619,11 @@ def package_phase1(
     )
     atomic_write_parquet(table, manifest_path)
 
+    # Top-level flat metrics parquet: the Phase-2 join surface. Every S0-S3
+    # metric column keyed by clip_id, so later labeling releases only append a
+    # sibling parquet (same key) and never rewrite the audio tars.
+    write_metrics_parquet(ordered, shard_assignment, config, export_dir)
+
     n_audio = sum(1 for e in ordered if e.has_audio)
     (export_dir / "README.md").write_text(
         _dataset_card(config, len(ordered), n_audio), encoding="utf-8"
@@ -621,6 +639,92 @@ def package_phase1(
     if mark_done:
         write_done_marker("pack", PACK_TASK_ID, config.paths.done)
     return result
+
+
+def write_metrics_parquet(
+    entries: Sequence[Phase1Entry],
+    shard_assignment: dict[str, str],
+    config: Config,
+    export_dir: Path,
+) -> Optional[Path]:
+    """Write ``metadata/phase1_metrics.parquet``: one flat row per clip.
+
+    Carries every column of :func:`query_phase1_survivors` plus the release
+    ``shard`` each clip landed in and the pipeline/schema version. This is the
+    stable, queryable metadata surface: Phase-2 labels ship as a *sibling*
+    parquet keyed by the same ``clip_id`` (see :func:`upload_s4_labels`), so
+    adding meta never touches ``data/*.tar``.
+    """
+    rows: list[dict[str, Any]] = []
+    for e in entries:
+        if e.metrics_row is None:
+            continue
+        row = dict(e.metrics_row)
+        row["shard"] = shard_assignment.get(e.clip_id, "")
+        row["has_audio"] = e.has_audio
+        row["audio_ext"] = e.audio_ext
+        row["pipeline_version"] = config.version
+        row["schema_version"] = config.schema_version
+        rows.append(row)
+    if not rows:
+        return None
+    path = export_dir / "metadata" / "phase1_metrics.parquet"
+    return atomic_write_parquet(pa.Table.from_pylist(rows), path)
+
+
+def upload_s4_labels(
+    config: Config,
+    *,
+    repo_id: Optional[str] = None,
+    revision: Optional[str] = None,
+    token: Optional[str] = None,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Incrementally publish Phase-2 S4 labels next to the Phase-1 release.
+
+    Merges every ``stage/s4_labels/part-*.parquet`` into one
+    ``metadata/s4_labels.parquet`` (keyed by ``clip_id``, joins 1:1 against
+    ``metadata/phase1_metrics.parquet``) and uploads just that file to the
+    Phase-1 revision. Anytime-friendly: re-run it as more slices finish -- the
+    file is simply replaced with a superset. Audio tars are never rewritten.
+
+    Returns:
+        ``(local_parquet_path, upload_skipped_reason)``; reason is None when
+        the upload succeeded, and the path is None when no labels exist yet.
+    """
+    glob = parquet_glob(config.paths.s4_labels)
+    export_dir = Path(config.paths.export) / EXPORT_SUBDIR
+    try:
+        table = query_parquet("SELECT * FROM labels", labels=glob).arrow()
+    except Exception:
+        return None, "no s4 label parquet found yet"
+    if table.num_rows == 0:
+        return None, "s4 labels are empty"
+    table = table.append_column(
+        "schema_version", pa.array([config.schema_version] * table.num_rows)
+    )
+    path = atomic_write_parquet(table, export_dir / "metadata" / "s4_labels.parquet")
+
+    target_repo = repo_id or config.hf.repo_id
+    if not target_repo:
+        return path, "hf.repo_id not set; produced parquet only"
+    tok = token or os.environ.get(HF_TOKEN_ENV)
+    if not tok:
+        return path, f"{HF_TOKEN_ENV} not set; produced parquet only"
+    rev = revision or config.hf.phase1_revision
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=tok)
+        api.upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo="metadata/s4_labels.parquet",
+            repo_id=target_repo,
+            repo_type="dataset",
+            revision=rev,
+        )
+        return path, None
+    except Exception as exc:  # pragma: no cover - network path
+        return path, f"upload failed: {exc}"
 
 
 def _replay_shard_assignment(

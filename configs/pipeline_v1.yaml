@@ -58,7 +58,8 @@ s3:
   embedding_dim: 192
   min_win_cos_threshold: 0.70
   mean_win_cos_threshold: 0.80
-  f0_confidence_poor: 0.60
+  # dio 的 voiced 置信度系统性低于 harvest (实测 ~0.15-0.2), 随 S2 换 dio 同步下调; 待 pilot 校准.
+  f0_confidence_poor: 0.45
   min_trim_residual_s: 3.0
 
 # S4 -- Qwen3-Omni 云端 API 打标
@@ -113,7 +114,7 @@ repack:
 
 # HuggingFace 数据集发布 (Phase-1 过滤子集 + 最终标注子集共用一个 repo, 用 revision 区分)
 hf:
-  repo_id: null                     # 例: org/emilia-expressive-zh; null -> 只出目录不上传
+  repo_id: leeoxiang/emilia-expressive-zh   # null -> 只出目录不上传
   private: true
   phase1_revision: phase1-filtered  # Phase-1 过滤子集发布到的分支
   shard_bytes: 1000000000           # ~1GB/shard
