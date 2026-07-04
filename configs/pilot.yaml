@@ -31,7 +31,7 @@ s1:
   # DNSMOS 已从 S1 移除 (CPU 串行且慢; S0 保留 Emilia 自带 dnsmos>=3.2 粗筛)
   min_snr_db: 20.0
   max_clipping_ratio: 0.001
-  min_bandwidth_hz: 4000.0   # 初值 8000 在真实分布上杀掉 90%+ (roll-off .99 中位仅 3.9k); 按中位切
+  min_bandwidth_hz: 0.0      # 闸门放开 (指标仍入库); 真实分布上 8k 初值会杀 90%+, 音质惩罚交给 aes_pq
 
 s2:
   z_weights:
