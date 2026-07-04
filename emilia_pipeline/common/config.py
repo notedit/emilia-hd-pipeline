@@ -249,6 +249,39 @@ class RepackConfig(_Base):
 
 
 # ---------------------------------------------------------------------------
+# HuggingFace release (dataset publish; both the Phase-1 filtered subset and
+# the final S5-labeled subset upload to the same repo, distinguished by revision)
+# ---------------------------------------------------------------------------
+
+
+class HFConfig(_Base):
+    """HuggingFace dataset publish settings (design §2 收尾 tail).
+
+    The Phase-1 filtered subset and the final S5-labeled subset publish to the
+    *same* ``repo_id`` on different git ``revision``s (a branch), so consumers can
+    pin either view. The token is never stored here -- it is read from the
+    ``HF_TOKEN`` env at upload time, and upload is a graceful no-op when unset.
+    """
+
+    # Target Hub dataset repo, e.g. "org/emilia-expressive-zh". None -> upload
+    # is skipped (folder still produced), so a repo-less config is a clean no-op.
+    repo_id: Optional[str] = None
+    # Keep the created repo private.
+    private: bool = True
+    # Git revision (branch) the Phase-1 filtered subset publishes to. The final
+    # labeled release uses ``main`` (or its own revision), keeping the two views
+    # in one repo per the "same repo, different revision" decision.
+    phase1_revision: str = "phase1-filtered"
+    # Target uncompressed bytes per output tar shard (default ~1GB).
+    shard_bytes: int = 1_000_000_000
+    # Embed the full S0-S3 metric block in each clip's meta JSON (research view).
+    # When False, only the lean identity + verdict + priority fields are written.
+    include_metrics: bool = True
+    # Apply the S2 global top-fraction prosody gate when selecting survivors.
+    apply_s2_top_fraction: bool = True
+
+
+# ---------------------------------------------------------------------------
 # Runtime (parallelism, mock toggles)
 # ---------------------------------------------------------------------------
 
@@ -307,6 +340,7 @@ class Config(_Base):
     s4: S4Config = Field(default_factory=S4Config)
     s5: S5Config = Field(default_factory=S5Config)
     repack: RepackConfig = Field(default_factory=RepackConfig)
+    hf: HFConfig = Field(default_factory=HFConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
 
@@ -348,6 +382,7 @@ __all__ = [
     "SelectionWeights",
     "S5Config",
     "RepackConfig",
+    "HFConfig",
     "RuntimeConfig",
     "ModelsConfig",
     "Config",

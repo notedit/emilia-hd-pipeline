@@ -6,12 +6,15 @@ Modules:
     parquet + per-clip published JSON).
   * :mod:`hf_package` -- shuffle + WebDataset tar/parquet packaging under
     ``export/`` and optional ``upload_large_folder`` to the Hub.
+  * :mod:`phase1_hf`  -- short-circuit release of the Phase-1 *filtered* subset
+    (S0-S3 survivors) straight to the same Hub repo on its own revision, without
+    waiting for Phase-2 labeling / S5 scoring.
   * :mod:`monitor`    -- cron-style per-stage progress / S4 cost / distribution
     snapshot.
 """
 
 from __future__ import annotations
 
-from . import hf_package, monitor, s5_score
+from . import hf_package, monitor, phase1_hf, s5_score
 
-__all__ = ["s5_score", "hf_package", "monitor"]
+__all__ = ["s5_score", "hf_package", "phase1_hf", "monitor"]

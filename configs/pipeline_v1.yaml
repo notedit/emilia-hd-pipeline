@@ -111,6 +111,15 @@ repack:
   # degraded_pass is labeled + scored but publish-gated separately in s5).
   survivor_verdicts: [single, intruded_trimmed, degraded_pass]
 
+# HuggingFace 数据集发布 (Phase-1 过滤子集 + 最终标注子集共用一个 repo, 用 revision 区分)
+hf:
+  repo_id: null                     # 例: org/emilia-expressive-zh; null -> 只出目录不上传
+  private: true
+  phase1_revision: phase1-filtered  # Phase-1 过滤子集发布到的分支
+  shard_bytes: 1000000000           # ~1GB/shard
+  include_metrics: true             # 每个 clip 内嵌完整 S0-S3 指标 (研究视图)
+  apply_s2_top_fraction: true       # 存活集是否再套 S2 全局 top_fraction 闸门
+
 # 模型版本 / 权重位置 (集中在 /data/weights)
 models:
   aesthetics_model: audiobox-aesthetics

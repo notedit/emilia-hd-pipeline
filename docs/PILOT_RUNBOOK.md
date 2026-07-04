@@ -187,6 +187,39 @@ PY
 
 ---
 
+## 3b.（可选）Phase-1 过滤子集直发 HuggingFace —— 跳过 Phase 2
+
+如果只想把 **Phase-1 过滤结果**（S0-S3 存活集）直接发到 HF、不等 Phase 2 标注 / S5 打分，
+用这条短路路径。它复用 repack 的存活集定义与全局 `prosody_dsp_score`，音频**直接从
+`source/*.tar` 读并内联应用 S3 裁剪**（不依赖 `run_repack`），每条 clip 产出
+`{clip_id}.flac` + `{clip_id}.json`（含完整 S0-S3 指标块）。
+
+```bash
+python - <<'PY'
+import os
+from emilia_pipeline.common.config import load_config
+from emilia_pipeline.scoring import phase1_hf
+cfg = load_config(os.environ["CFG"])
+# pilot：关掉 top-40% 分位门看全量；小 shard 便于观察
+res = phase1_hf.package_phase1(cfg, apply_s2_top_fraction=False, target_shard_bytes=100_000_000)
+print(res.n_clips, res.n_with_audio, res.export_dir)
+# 真上传需 HF_TOKEN + 配置 hf.repo_id；缺任一则只产出 export/hf_phase1/ 不上传。
+# 与最终标注版共用同一 repo，发到 hf.phase1_revision 分支（默认 phase1-filtered）。
+# phase1_hf.upload_phase1_to_hf(cfg)   # 或传 repo_id=/revision= 覆盖
+PY
+```
+
+产出：`export/hf_phase1/data/shard-*.tar`、`export/hf_phase1/phase1_manifest_v1.parquet`、
+`export/hf_phase1/README.md`（自动生成的 dataset card，含过滤漏斗与 schema 说明）。
+配置见 `configs/pipeline_v1.yaml` 的 `hf:` 段（`repo_id` / `private` / `phase1_revision` /
+`shard_bytes` / `include_metrics` / `apply_s2_top_fraction`）。
+
+**要观察**：shard 内每条 clip 是否都有 `.flac` + `.json` 两个 member；`README.md` 里的
+clip 数与漏斗阈值是否符合预期;`upload_phase1_to_hf` 在缺 `HF_TOKEN` / `hf.repo_id` 时应优雅跳过。
+
+
+---
+
 ## 4. Phase 2 —— S4 Qwen3-Omni 真调用（最贵的一步）
 
 S4 走公司内部 **Venus LLM 代理**（OpenAI 兼容端点，专有 `venus_multimodal_url` 音频类型），
