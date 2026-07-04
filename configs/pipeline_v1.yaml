@@ -34,7 +34,7 @@ s1:
   # DNSMOS 已从 S1 移除 (CPU 串行且慢, 边际拦截率实测 ~2%; S0 保留 Emilia 自带 dnsmos>=3.2 粗筛)
   min_snr_db: 20.0
   max_clipping_ratio: 0.001
-  min_bandwidth_hz: 8000.0
+  min_bandwidth_hz: 4000.0   # 初值 8000 在真实分布上杀掉 90%+ (roll-off .99 中位仅 3.9k); 按中位切
 
 # S2 -- 韵律丰富度粗筛 (CPU DSP)
 s2:
