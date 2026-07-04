@@ -539,7 +539,7 @@ Derived from [amphion/Emilia-Dataset](https://huggingface.co/datasets/amphion/Em
 | Stage | What it does |
 |-------|--------------|
 | S0 | Metadata prefilter: {s0.min_duration_s}-{s0.max_duration_s}s, lang=`{s0.language}`, original DNSMOS ≥ {s0.min_original_dnsmos}, text ≥ {s0.min_text_chars} chars |
-| S1 | Acoustic gate: aes_pq ≥ {s1.min_aes_pq}, aes_pc ≤ {s1.max_aes_pc}, SNR ≥ {s1.min_snr_db} dB, bandwidth ≥ {s1.min_bandwidth_hz} Hz |
+| S1 | Acoustic gate: aes_pq ≥ {s1.min_aes_pq}, aes_pc ≤ {s1.max_aes_pc}, aes_ce ≥ {s1.min_aes_ce}, SNR ≥ {s1.min_snr_db} dB, bandwidth ≥ {s1.min_bandwidth_hz} Hz |
 | S2 | Prosody richness (top {int(config.s2.top_fraction * 100)}% by `prosody_dsp_score`) |
 | S3 | Sliding-window speaker purity (verdicts: {", ".join(config.repack.survivor_verdicts)}) |
 

@@ -71,7 +71,8 @@ class S1Config(_Base):
 
     min_aes_pq: float = 7.0  # main gate
     max_aes_pc: float = 2.5  # low complexity = clean single-speaker
-    # aesthetics CE / CU: no hard threshold, stored for S5.
+    min_aes_ce: float = 5.0  # content enjoyment floor (~p20 on real Emilia)
+    # aesthetics CU: no hard threshold, stored for S5.
     # DNSMOS was retired from S1 (CPU-serial, ~2% marginal rejection on top of
     # aes_pq; the S0 metadata gate keeps Emilia's own dnsmos >= 3.2).
     min_snr_db: float = 20.0

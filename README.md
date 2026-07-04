@@ -46,7 +46,8 @@ Phase 2（云端 API 打标, worklist 分片认领, anytime 可停）
 | 指标 | 模型/方法 | 阈值（初值，待校准） |
 |---|---|---|
 | aes_pq / aes_pc | Audiobox-Aesthetics（GPU，32 条/块前向） | pq ≥ 7.0（主闸门）· pc ≤ 2.5 |
-| aes_ce / aes_cu | 同上 | 不设闸门，入库供 S5 |
+| aes_ce | 同上 | ≥ 5.0（content enjoyment 下限，~p20） |
+| aes_cu | 同上 | 不设闸门，入库供 S5 |
 | snr_db | 能量分位法（CPU） | ≥ 20 dB |
 | clipping_ratio | CPU | ≤ 0.001 |
 | bandwidth_hz | 频谱 roll-off（CPU，防上采样假高清） | ≥ 8 kHz |

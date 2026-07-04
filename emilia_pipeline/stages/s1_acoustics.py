@@ -261,6 +261,7 @@ def s1_reject_reason(row: RowLike, config: Config) -> str | None:
     Gates (design §4 S1, thresholds from ``config.s1``):
       * ``aes_pq  >= min_aes_pq``      (main gate; source-separation artifacts)
       * ``aes_pc  <= max_aes_pc``      (low complexity = clean single speaker)
+      * ``aes_ce  >= min_aes_ce``      (content-enjoyment floor)
       * ``snr_db  >= min_snr_db``
       * ``clipping_ratio <= max_clipping_ratio``
       * ``bandwidth_hz   >= min_bandwidth_hz``
@@ -279,6 +280,8 @@ def s1_reject_reason(row: RowLike, config: Config) -> str | None:
         reasons.append(f"aes_pq<{s1.min_aes_pq}")
     if float(_get(row, "aes_pc")) > s1.max_aes_pc:
         reasons.append(f"aes_pc>{s1.max_aes_pc}")
+    if float(_get(row, "aes_ce")) < s1.min_aes_ce:
+        reasons.append(f"aes_ce<{s1.min_aes_ce}")
     if float(_get(row, "snr_db")) < s1.min_snr_db:
         reasons.append(f"snr_db<{s1.min_snr_db}")
     if float(_get(row, "clipping_ratio")) > s1.max_clipping_ratio:

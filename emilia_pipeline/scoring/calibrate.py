@@ -40,13 +40,14 @@ from ..common.prosody_sql import prosody_dsp_score_sql
 _S1_GATES = [
     ("aes_pq", "min", "min_aes_pq"),
     ("aes_pc", "max", "max_aes_pc"),
+    ("aes_ce", "min", "min_aes_ce"),
     ("snr_db", "min", "min_snr_db"),
     ("clipping_ratio", "max", "max_clipping_ratio"),
     ("bandwidth_hz", "min", "min_bandwidth_hz"),
 ]
 # S1 metrics stored but not gated (kept for S5 scoring); report distribution
 # only. dnsmos_* are NULL on rows scanned after DNSMOS was retired from S1.
-_S1_UNGATED = ["aes_ce", "aes_cu", "dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl", "loudness_lufs"]
+_S1_UNGATED = ["aes_cu", "dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl", "loudness_lufs"]
 _S2_METRICS = [
     "f0_std_st", "f0_range_st", "energy_std_db", "speech_rate_cps",
     "rate_var_cv", "pause_count", "pause_total_ms", "f0_tracker_confidence",

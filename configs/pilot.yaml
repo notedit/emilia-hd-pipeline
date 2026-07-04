@@ -28,6 +28,7 @@ s0:
 s1:
   min_aes_pq: 7.0
   max_aes_pc: 2.5
+  min_aes_ce: 5.0        # content enjoyment 下限 (~p20)
   # DNSMOS 已从 S1 移除 (CPU 串行且慢; S0 保留 Emilia 自带 dnsmos>=3.2 粗筛)
   min_snr_db: 20.0
   max_clipping_ratio: 0.001

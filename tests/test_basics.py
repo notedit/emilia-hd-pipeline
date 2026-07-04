@@ -54,7 +54,7 @@ def test_phase1_worker_invariants(synth_shard) -> None:
 def test_s1_pass_predicate(base_config) -> None:
     cfg = base_config
     good = {
-        "aes_pq": 8.0, "aes_pc": 1.5,
+        "aes_pq": 8.0, "aes_pc": 1.5, "aes_ce": 6.0,
         "snr_db": 30.0, "clipping_ratio": 0.0, "bandwidth_hz": 11000.0,
     }
     assert s1_pass(good, cfg)
