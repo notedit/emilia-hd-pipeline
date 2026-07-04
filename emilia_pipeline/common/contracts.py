@@ -231,9 +231,9 @@ class S1AcousticsRow(_Base):
     aes_pc: float
     aes_ce: float
     aes_cu: float
-    # DNSMOS P.835. None == skipped by the in-stage short-circuit: DNSMOS only
-    # runs on clips that already pass every other S1 gate (it is the expensive
-    # serial CPU model). A ``passed`` row always carries real values.
+    # DNSMOS P.835 -- retired from S1 (CPU-serial and slow; S0 keeps Emilia's
+    # own dnsmos >= 3.2 metadata gate). Columns kept for schema stability with
+    # rows produced by earlier runs; current runs always store None.
     dnsmos_sig: Optional[float] = None
     dnsmos_bak: Optional[float] = None
     dnsmos_ovrl: Optional[float] = None
@@ -399,7 +399,8 @@ class DnsmosBlock(_Base):
 
 class AcousticsBlock(_Base):
     aesthetics: AestheticsBlock
-    dnsmos_p835: DnsmosBlock
+    # None for clips scanned after DNSMOS was retired from S1.
+    dnsmos_p835: Optional[DnsmosBlock] = None
     snr_db: float
     clipping_ratio: float
     bandwidth_hz: float

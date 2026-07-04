@@ -7,8 +7,8 @@ around the S1 gate:
 
   * pass A (all S0 survivors): decode + cheap S1 CPU metrics. The decoded audio
     is gathered back into the main process where Audiobox-Aesthetics scores the
-    whole batch; DNSMOS then runs only on clips passing every other S1 gate
-    (in-stage short-circuit, see :mod:`..stages.s1_acoustics`).
+    whole batch in fixed-size chunks (DNSMOS is retired from S1; S0 keeps
+    Emilia's own dnsmos metadata gate).
   * pass B (S1 survivors only): S2 prosody DSP features (F0 / VAD / energy) on
     the already-decoded audio. S1-failed clips never pay for F0 (design §4
     short-circuit: "S1 fail 不算 S2/S3").

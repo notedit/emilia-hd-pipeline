@@ -548,10 +548,14 @@ def build_meta_record(
             ce=float(row["aes_ce"]),
             cu=float(row["aes_cu"]),
         ),
-        dnsmos_p835=DnsmosBlock(
-            sig=float(row["dnsmos_sig"]),
-            bak=float(row["dnsmos_bak"]),
-            ovrl=float(row["dnsmos_ovrl"]),
+        dnsmos_p835=(
+            DnsmosBlock(
+                sig=float(row["dnsmos_sig"]),
+                bak=float(row["dnsmos_bak"]),
+                ovrl=float(row["dnsmos_ovrl"]),
+            )
+            if _opt_float(row.get("dnsmos_ovrl")) is not None
+            else None  # DNSMOS retired from S1; older rows may still carry it
         ),
         snr_db=float(row["snr_db"]),
         clipping_ratio=float(row["clipping_ratio"]),

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi)",
+      "Bash(ls /data)",
+      "Read(//data/**)",
+      "Bash(ls /data/emilia-*)"
+    ]
+  }
+}

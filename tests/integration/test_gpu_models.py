@@ -152,8 +152,6 @@ def test_real_campplus_geometry(real_config: Config) -> None:
 
 def test_real_s1_rows_schema_matches_mock(real_config: Config) -> None:
     _require(real_config, "aesthetics")
-    if weights_skip_reason(real_config, kind="dnsmos"):
-        pytest.skip(weights_skip_reason(real_config, kind="dnsmos"))
     models = s1_acoustics.get_s1_models(real_config)
     assert models.is_mock is False
     try:
@@ -166,8 +164,9 @@ def test_real_s1_rows_schema_matches_mock(real_config: Config) -> None:
         assert isinstance(row, S1AcousticsRow)
         # model_dump must round-trip (schema parity with the mock tier).
         assert S1AcousticsRow.model_validate(row.model_dump()) == row
-        for key in ("aes_pq", "dnsmos_ovrl", "snr_db", "bandwidth_hz"):
+        for key in ("aes_pq", "snr_db", "bandwidth_hz"):
             assert np.isfinite(getattr(row, key))
+        assert row.dnsmos_ovrl is None  # DNSMOS retired from S1
         assert 0.0 <= row.clipping_ratio <= 1.0
 
 

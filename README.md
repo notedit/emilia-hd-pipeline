@@ -47,15 +47,14 @@ Phase 2（云端 API 打标, worklist 分片认领, anytime 可停）
 |---|---|---|
 | aes_pq / aes_pc | Audiobox-Aesthetics（GPU，32 条/块前向） | pq ≥ 7.0（主闸门）· pc ≤ 2.5 |
 | aes_ce / aes_cu | 同上 | 不设闸门，入库供 S5 |
-| dnsmos_ovrl (P.835) | DNSMOS onnx（CPU 串行，**短路**） | ≥ 3.5 |
 | snr_db | 能量分位法（CPU） | ≥ 20 dB |
 | clipping_ratio | CPU | ≤ 0.001 |
 | bandwidth_hz | 频谱 roll-off（CPU，防上采样假高清） | ≥ 8 kHz |
 | loudness_lufs | pyloudnorm（CPU） | 入库不设闸门 |
 
-**站内短路**：DNSMOS 是最贵的串行模型，只对"其余闸门全过"的候选计算（实测边际拦截率
-~2%），跳过的行 `dnsmos_* = NULL`；`passed` 行必有真实值，校准查询不受影响。
-pass/reject 仅是建议列，改阈值 = 改 SQL 重放，不重跑管线。
+**DNSMOS 已从 S1 移除**（onnx 只能 CPU 串行且慢；实测在 aes_pq≥7.0 之上的边际拦截率
+仅 ~2%）——S0 保留 Emilia 自带 `dnsmos ≥ 3.2` 的 metadata 粗筛，行 schema 中 `dnsmos_*`
+列保留（NULL）以兼容旧数据。pass/reject 仅是建议列，改阈值 = 改 SQL 重放，不重跑管线。
 
 ### S2 · 韵律丰富度粗筛（`stages/s2_prosody.py`，CPU DSP，**仅 S1 幸存者**）
 

@@ -1,9 +1,12 @@
 """S1 - strict acoustic filtering (design doc §4 S1).
 
-This stage combines two GPU models (Audiobox-Aesthetics -> pq/pc/ce/cu and
-DNSMOS P.835 -> sig/bak/ovrl) with three CPU DSP metrics (SNR, clipping ratio,
-effective bandwidth via spectral roll-off) into one :class:`S1AcousticsRow` per
-clip.
+This stage combines one GPU model (Audiobox-Aesthetics -> pq/pc/ce/cu) with
+CPU DSP metrics (SNR, clipping ratio, effective bandwidth via spectral
+roll-off, loudness) into one :class:`S1AcousticsRow` per clip. DNSMOS was
+retired from the stage (onnx CPU-serial and slow; pilot-measured marginal
+rejection ~2% on top of aes_pq>=7.0) -- S0's metadata gate keeps Emilia's own
+dnsmos >= 3.2, and the ``dnsmos_*`` row columns remain (NULL) for schema
+stability with data produced by earlier runs.
 
 Design conventions honored here:
   * The GPU models are obtained through :func:`emilia_pipeline.common.models.get_model`
@@ -13,11 +16,9 @@ Design conventions honored here:
     mirrored into the advisory ``passed`` / ``reject_reason`` columns for
     convenience). Threshold changes = re-run :func:`s1_pass` over stored
     parquet, not the pipeline.
-  * Short-circuit rules: the *caller* (the fusion worker) skips S2/S3 when
-    :func:`s1_pass` is False. Within S1 itself, DNSMOS -- the expensive serial
-    CPU model -- only runs on clips passing every other gate (pilot-measured
-    marginal rejection ~2%); skipped clips store ``None`` in ``dnsmos_*``. All
-    cheap metrics are still computed in full for ROC calibration.
+  * Short-circuit rule: the *caller* (the fusion worker) skips S2/S3 when
+    :func:`s1_pass` is False. S1's own metrics are computed in full for ROC
+    calibration.
 
 Public surface:
   * :func:`compute_cpu_metrics` -- SNR / clipping / bandwidth for one clip.
@@ -39,12 +40,7 @@ from ..common import audio as audio_utils
 from ..common.config import Config
 from ..common.contracts import S1AcousticsRow
 from ..common.io_utils import atomic_write_parquet, parquet_glob
-from ..common.models import (
-    MODEL_AESTHETICS,
-    MODEL_DNSMOS,
-    BaseAudioModel,
-    get_model,
-)
+from ..common.models import MODEL_AESTHETICS, BaseAudioModel, get_model
 
 # ---------------------------------------------------------------------------
 # CPU DSP tuning constants (frame geometry for SNR / bandwidth estimation).
@@ -216,25 +212,22 @@ def compute_cpu_metrics(arr: np.ndarray, sr: int) -> dict[str, float]:
 
 @dataclass
 class S1ModelBundle:
-    """The two GPU models S1 needs, obtained via the mock-aware factory.
+    """The GPU model S1 needs, obtained via the mock-aware factory.
 
     Attributes:
         aesthetics: Audiobox-Aesthetics model (pq / pc / ce / cu).
-        dnsmos: DNSMOS P.835 model (sig / bak / ovrl).
     """
 
     aesthetics: BaseAudioModel
-    dnsmos: BaseAudioModel
 
     @property
     def is_mock(self) -> bool:
-        """True when both underlying models are mocks (test / key-less runs)."""
-        return bool(self.aesthetics.is_mock and self.dnsmos.is_mock)
+        """True when the underlying model is a mock (test / key-less runs)."""
+        return bool(self.aesthetics.is_mock)
 
     def close(self) -> None:
-        """Release both models' resources."""
+        """Release model resources."""
         self.aesthetics.close()
-        self.dnsmos.close()
 
 
 def get_s1_models(config: Config) -> S1ModelBundle:
@@ -247,10 +240,7 @@ def get_s1_models(config: Config) -> S1ModelBundle:
     Returns:
         A :class:`S1ModelBundle`.
     """
-    return S1ModelBundle(
-        aesthetics=get_model(MODEL_AESTHETICS, config),
-        dnsmos=get_model(MODEL_DNSMOS, config),
-    )
+    return S1ModelBundle(aesthetics=get_model(MODEL_AESTHETICS, config))
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +261,6 @@ def s1_reject_reason(row: RowLike, config: Config) -> str | None:
     Gates (design §4 S1, thresholds from ``config.s1``):
       * ``aes_pq  >= min_aes_pq``      (main gate; source-separation artifacts)
       * ``aes_pc  <= max_aes_pc``      (low complexity = clean single speaker)
-      * ``dnsmos_ovrl >= min_dnsmos_ovrl``
       * ``snr_db  >= min_snr_db``
       * ``clipping_ratio <= max_clipping_ratio``
       * ``bandwidth_hz   >= min_bandwidth_hz``
@@ -290,11 +279,6 @@ def s1_reject_reason(row: RowLike, config: Config) -> str | None:
         reasons.append(f"aes_pq<{s1.min_aes_pq}")
     if float(_get(row, "aes_pc")) > s1.max_aes_pc:
         reasons.append(f"aes_pc>{s1.max_aes_pc}")
-    # None == DNSMOS skipped by the in-stage short-circuit (another gate already
-    # failed); the gate is simply not evaluated then.
-    dnsmos_ovrl = _get(row, "dnsmos_ovrl")
-    if dnsmos_ovrl is not None and float(dnsmos_ovrl) < s1.min_dnsmos_ovrl:
-        reasons.append(f"dnsmos_ovrl<{s1.min_dnsmos_ovrl}")
     if float(_get(row, "snr_db")) < s1.min_snr_db:
         reasons.append(f"snr_db<{s1.min_snr_db}")
     if float(_get(row, "clipping_ratio")) > s1.max_clipping_ratio:
@@ -332,13 +316,11 @@ def compute_s1_rows(
 ) -> list[S1AcousticsRow]:
     """Compute S1 rows for a batch of decoded clips.
 
-    Aesthetics runs once over the whole batch; DNSMOS (the expensive serial CPU
-    model) is short-circuited: it only runs on clips that already pass every
-    *other* gate (aes_pq / aes_pc / snr / clipping / bandwidth), since a clip
-    rejected by a cheap gate is rejected regardless of its DNSMOS score. Skipped
-    clips store ``None`` in the ``dnsmos_*`` columns; every ``passed`` row always
-    carries real DNSMOS values, so the marginal-rejection calibration query
-    ("PQ 过但 OVRL 拒") stays answerable. No row is dropped here.
+    Aesthetics runs chunked over the whole batch; CPU metrics are computed (or
+    threaded through) per clip. The ``dnsmos_*`` columns always store ``None``
+    (stage retired); every metric is stored on the row and the advisory
+    ``passed`` / ``reject_reason`` columns are filled from :func:`s1_pass`.
+    No row is dropped here.
 
     Args:
         clips: Sequence of ``(clip_id, samples, sample_rate)`` tuples. Samples
@@ -367,10 +349,7 @@ def compute_s1_rows(
     batch: list[tuple[np.ndarray, int]] = [(arr, sr) for _, arr, sr in clips]
     aes_out = models.aesthetics.predict(batch)
 
-    # Pass 1: everything except DNSMOS. Clips whose cheap gates all pass are
-    # DNSMOS candidates; the rest are rejected without paying for DNSMOS.
-    partial: list[dict[str, Any]] = []
-    candidates: list[int] = []
+    rows: list[S1AcousticsRow] = []
     for i, ((clip_id, arr, sr), aes) in enumerate(zip(clips, aes_out)):
         cpu = cpu_metrics[i] if cpu_metrics is not None else compute_cpu_metrics(arr, sr)
         metrics: dict[str, Any] = {
@@ -388,20 +367,6 @@ def compute_s1_rows(
             "bandwidth_hz": cpu["bandwidth_hz"],
             "loudness_lufs": float(cpu.get("loudness_lufs", 0.0)),
         }
-        partial.append(metrics)
-        if s1_reject_reason(metrics, config) is None:
-            candidates.append(i)
-
-    # Pass 2: DNSMOS only on the candidates.
-    if candidates:
-        dns_out = models.dnsmos.predict([batch[i] for i in candidates])
-        for i, dns in zip(candidates, dns_out):
-            partial[i]["dnsmos_sig"] = float(dns["dnsmos_sig"])
-            partial[i]["dnsmos_bak"] = float(dns["dnsmos_bak"])
-            partial[i]["dnsmos_ovrl"] = float(dns["dnsmos_ovrl"])
-
-    rows: list[S1AcousticsRow] = []
-    for metrics in partial:
         reason = s1_reject_reason(metrics, config)
         rows.append(
             S1AcousticsRow(**metrics, passed=(reason is None), reject_reason=reason)

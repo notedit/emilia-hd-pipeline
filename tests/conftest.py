@@ -89,7 +89,6 @@ def relaxed_config(tmp_config: Config) -> Config:
         update={
             "min_aes_pq": 0.0,
             "max_aes_pc": 100.0,
-            "min_dnsmos_ovrl": 0.0,
             "min_snr_db": -100.0,
             "max_clipping_ratio": 1.0,
             "min_bandwidth_hz": 0.0,

@@ -41,14 +41,11 @@ def test_phase1_worker_invariants(synth_shard) -> None:
     assert len(res.s3_rows) == n_s1_pass
     assert res.embeddings.shape == (n_s1_pass, cfg.s3.embedding_dim)
 
-    # DNSMOS short-circuit: a passed row always has real values; a row skipped
-    # by the short-circuit has None and a non-dnsmos reject reason.
+    # DNSMOS is retired from S1: columns exist for schema stability but are
+    # always None, and no gate ever rejects on them.
     for row in res.s1_rows:
-        if row.passed:
-            assert row.dnsmos_ovrl is not None
-        if row.dnsmos_ovrl is None:
-            assert not row.passed
-            assert "dnsmos" not in (row.reject_reason or "")
+        assert row.dnsmos_ovrl is None
+        assert "dnsmos" not in (row.reject_reason or "")
 
     # Re-running a completed shard is a no-op (idempotency via done marker).
     assert worker_mod.run_shard(tar, cfg, parallel=False) is None
@@ -57,11 +54,9 @@ def test_phase1_worker_invariants(synth_shard) -> None:
 def test_s1_pass_predicate(base_config) -> None:
     cfg = base_config
     good = {
-        "aes_pq": 8.0, "aes_pc": 1.5, "dnsmos_ovrl": 3.8,
+        "aes_pq": 8.0, "aes_pc": 1.5,
         "snr_db": 30.0, "clipping_ratio": 0.0, "bandwidth_hz": 11000.0,
     }
     assert s1_pass(good, cfg)
     assert s1_reject_reason({**good, "aes_pq": 5.0}, cfg) == f"aes_pq<{cfg.s1.min_aes_pq}"
-    # None == DNSMOS skipped by the in-stage short-circuit: gate not evaluated.
-    assert s1_pass({**good, "dnsmos_ovrl": None}, cfg)
-    assert not s1_pass({**good, "dnsmos_ovrl": 1.0}, cfg)
+    assert not s1_pass({**good, "snr_db": 3.0}, cfg)
