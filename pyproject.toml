@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emilia-pipeline"
+version = "1.3.0"
+description = "Emilia high-expressiveness subset extraction pipeline (VoxSift / Emilia-ZH)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pyarrow",
+    "soundfile",
+    "pydantic>=2",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+gpu = ["torch", "onnxruntime"]
+audio = ["librosa", "pyworld", "silero-vad", "pyloudnorm"]
+data = ["duckdb", "webdataset"]
+api = ["aiohttp", "openai", "dashscope"]
+dispatch = ["redis"]
+test = ["pytest", "pytest-asyncio"]
+
+[tool.setuptools.packages.find]
+include = ["emilia_pipeline*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: requires a GPU / real model weights",
+    "api: requires a live cloud API key (DashScope / OpenAI-compatible)",
+    "integration: end-to-end across multiple stages",
+    "slow: long-running test",
+]
+asyncio_mode = "auto"
+testpaths = ["tests"]

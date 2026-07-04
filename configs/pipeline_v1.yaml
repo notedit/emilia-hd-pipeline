@@ -1,0 +1,130 @@
+# Emilia 高表现力子集抽取 Pipeline -- 全部阈值 / 模型版本 / 路径 (design v1.1 §9)
+# 一切数值保留原值入库, 剔除判定只是查询条件; 阈值变更 = 改此文件 / 改 SQL, 不重跑管线.
+version: voxsift-emilia-v1.3
+schema_version: "1.3"
+
+paths:
+  root: /data/emilia-expressive
+  source: /data/emilia-expressive/source
+  stage: /data/emilia-expressive/stage
+  s0_prefilter: /data/emilia-expressive/stage/s0_prefilter
+  s1_acoustics: /data/emilia-expressive/stage/s1_acoustics
+  s2_prosody: /data/emilia-expressive/stage/s2_prosody
+  s3_speaker_features: /data/emilia-expressive/stage/s3_speaker/features
+  s3_speaker_embeddings: /data/emilia-expressive/stage/s3_speaker/embeddings
+  s4_labels: /data/emilia-expressive/stage/s4_labels
+  repacked: /data/emilia-expressive/repacked
+  manifests: /data/emilia-expressive/manifests
+  done: /data/emilia-expressive/done
+  failed: /data/emilia-expressive/failed
+  export: /data/emilia-expressive/export
+
+# S0 -- 元数据预筛 (不解码音频)
+s0:
+  min_duration_s: 3.0
+  max_duration_s: 20.0
+  language: zh
+  min_original_dnsmos: 3.2
+  min_text_chars: 4
+
+# S1 -- 严格声学过滤 (初值, 待 §10 校准)
+s1:
+  min_aes_pq: 7.0        # 主闸门, 对源分离伪影敏感
+  max_aes_pc: 2.5        # 低复杂度 = 干净单人语音
+  min_dnsmos_ovrl: 3.5
+  min_snr_db: 20.0
+  max_clipping_ratio: 0.001
+  min_bandwidth_hz: 8000.0
+
+# S2 -- 韵律丰富度粗筛 (CPU DSP)
+s2:
+  z_weights:
+    f0_std_st: 0.30
+    f0_range_st: 0.20
+    energy_std_db: 0.15
+    speech_rate_cps: 0.10
+    rate_var_cv: 0.15
+    pause_count: 0.10
+  top_fraction: 0.40     # 取全体存活样本 top 40%
+  vad_threshold: 0.5
+  vad_min_silence_ms: 100.0
+  f0_floor_hz: 60.0
+  f0_ceil_hz: 600.0
+
+# S3 -- 声纹滑窗纯度检测 (无全局聚类)
+s3:
+  window_s: 1.5
+  window_overlap: 0.5
+  embedding_dim: 192
+  min_win_cos_threshold: 0.70
+  mean_win_cos_threshold: 0.80
+  f0_confidence_poor: 0.60
+  min_trim_residual_s: 3.0
+
+# S4 -- Qwen3-Omni 云端 API 打标
+s4:
+  # Venus LLM proxy (OpenAI-compatible; proprietary venus_multimodal_url audio).
+  provider: venus
+  model: "server:272349"
+  base_url: http://v2.open.venus.oa.com/llmproxy
+  base_url_env: OPENAI_BASE_URL
+  api_key_env: OPENAI_API_KEY
+  prompt_version: v3.1
+  temperature: 0.0
+  max_tokens: 1024
+  max_concurrency: 8
+  request_timeout_s: 120.0
+  retry:
+    max_attempts: 5
+    base_delay_s: 1.0
+    max_delay_s: 60.0
+    backoff_multiplier: 2.0
+  sample_rate: 16000
+  slice_size: 5000
+  two_pass_triage: false
+  triage_pass_rate_switch: 0.60
+  # Venus path uses prompt-enforced JSON + client-side validation, not response_format.
+  use_guided_json: false
+
+# S5 -- 综合评分 + 分 Tier (DuckDB, 收尾一次性)
+s5:
+  weights:
+    pq: 0.35
+    prosody_dsp_score: 0.25
+    expressiveness_intensity: 0.30
+    ce: 0.10
+  allowed_text_verdicts: [match, fixable]
+  forbidden_defects: [truncated_head, truncated_tail]
+  allowed_verdicts: [single, intruded_trimmed]
+  tier_s_top_fraction: 0.20
+  tier_s_min_intensity: 3
+  tier_s_exclude_emotions: [neutral]
+  # Tier A/B split by expressiveness (B = 表现力一般 <= this), decoupled from emotion.
+  tier_b_max_expressiveness: 2
+  max_clips_per_speaker: null
+
+# 重打包 (Phase 1 -> Phase 2 桥)
+repack:
+  target_shard_bytes: 1000000000
+  priority_expr: "prosody_dsp_score * norm_aesthetics_pq"
+  # S3 verdicts eligible for labeling (broader than the S5 publish gate;
+  # degraded_pass is labeled + scored but publish-gated separately in s5).
+  survivor_verdicts: [single, intruded_trimmed, degraded_pass]
+
+# 模型版本 / 权重位置 (集中在 /data/weights)
+models:
+  aesthetics_model: audiobox-aesthetics
+  aesthetics_weights: /data/weights/audiobox/checkpoint.pt
+  dnsmos_onnx: /data/weights/dnsmos/sig_bak_ovr.onnx
+  campplus_model: cam++
+  campplus_weights: /data/weights/campplus/iic/speech_campplus_sv_zh-cn_16k-common
+
+# 运行时并行 / mock 开关
+runtime:
+  n_gpus: 2
+  total_cores: 176
+  cpu_per_gpu: null
+  audio_sample_rate: 24000
+  use_mocks: false
+  redis_url: null
+  mp_start_method: spawn
