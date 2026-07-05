@@ -110,10 +110,10 @@ hf:
 
 models:
   aesthetics_model: audiobox-aesthetics
-  aesthetics_weights: /opt/dlami/nvme/leolxliu/emilia-zh-full/weights/audiobox/checkpoint.pt
-  dnsmos_onnx: /opt/dlami/nvme/leolxliu/emilia-zh-full/weights/dnsmos/sig_bak_ovr.onnx
+  aesthetics_weights: /opt/dlami/nvme/leolxliu/weights/audiobox/checkpoint.pt
+  dnsmos_onnx: /opt/dlami/nvme/leolxliu/weights/dnsmos/sig_bak_ovr.onnx
   campplus_model: cam++
-  campplus_weights: /opt/dlami/nvme/leolxliu/emilia-zh-full/weights/campplus/iic/speech_campplus_sv_zh-cn_16k-common
+  campplus_weights: /opt/dlami/nvme/leolxliu/weights/campplus/iic/speech_campplus_sv_zh-cn_16k-common
 
 runtime:
   n_gpus: 8

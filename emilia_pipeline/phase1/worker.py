@@ -606,6 +606,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     source_dir = Path(args.source) if args.source else config.paths.source
     device = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 
+    if not config.runtime.use_mocks:
+        # Fail fast instead of silently degrading: get_model falls back to the
+        # deterministic mock when weights are missing/broken, which on a real
+        # run would contaminate every GPU-model metric without any error.
+        from ..common import models as models_mod
+
+        for name in (models_mod.MODEL_AESTHETICS, models_mod.MODEL_CAMPP):
+            probe = models_mod.get_model(name, config)
+            if probe.is_mock:
+                print(
+                    f"[phase1] FATAL: use_mocks=false but the real {name!r} model "
+                    f"is unavailable (weights missing or failed to load) - "
+                    f"refusing to run. Check config models.* paths."
+                )
+                return 2
+            probe.close()
+            del probe
+
     tasks = enumerate_shard_tasks(source_dir)
     pending = pending_tasks(tasks, PHASE1_STAGE, config.paths.done)
     if args.num_workers > 1:
