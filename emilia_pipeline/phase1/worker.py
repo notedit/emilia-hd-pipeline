@@ -193,15 +193,28 @@ def _pool_init(config: Config) -> None:
     _WORKER_STATE["vad"] = s2_prosody.get_vad(config)
 
 
-def _cpu_clip_task(item: tuple[int, str, bytes, str]) -> tuple[int, CpuResult]:
-    """Pass A: decode one clip and compute its S1 CPU metrics.
+# Every downstream model consumer targets 16 kHz (audiobox resamples to 16k
+# internally, CAM++ and the dio F0 tracker are 16k-native, silero VAD wants
+# 16k). Resampling once here -- inside the parallel CPU pool -- turns the
+# aesthetics predictor's serial per-item CPU sinc resample (the measured
+# full-scale bottleneck) into a no-op and halves the resident audio memory.
+_MODEL_SR = 16000
 
-    Runs inside a CPU-pool process (or inline). Returns the original index so the
-    caller can restore input order regardless of completion order.
+
+def _cpu_clip_task(item: tuple[int, str, bytes, str]) -> tuple[int, CpuResult]:
+    """Pass A: decode one clip, compute S1 CPU metrics, downsample for models.
+
+    Runs inside a CPU-pool process (or inline). CPU metrics (SNR / bandwidth /
+    clipping / loudness) are computed at the native rate so their semantics
+    stay comparable across runs; the audio handed onward is 16 kHz. Returns
+    the original index so the caller can restore input order.
     """
     index, clip_id, audio_bytes, _text = item
     arr, sr = audio_utils.decode_bytes(audio_bytes)
     cpu_metrics = s1_acoustics.compute_cpu_metrics(arr, sr)
+    if sr != _MODEL_SR:
+        arr = audio_utils.resample(arr, sr, _MODEL_SR)
+        sr = _MODEL_SR
     return index, CpuResult(clip_id=clip_id, audio=arr, sr=sr, cpu_metrics=cpu_metrics)
 
 
