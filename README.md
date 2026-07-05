@@ -34,7 +34,7 @@ Phase 2（云端 API 打标, worklist 分片认领, anytime 可停）
 
 | 条件 | 阈值 | 理由 |
 |---|---|---|
-| duration | 3.0 ≤ d ≤ 20.0 s | 短于 3s 无韵律结构，长于 20s 情感不纯 |
+| duration | 3.0 ≤ d ≤ 30.0 s | 短于 3s 无韵律结构，过长情感不纯 |
 | language | == zh | 本期只做中文 |
 | 原始 dnsmos | ≥ 3.2 | 比 Emilia 原始 3.0 收紧的粗刀 |
 | text | 非空且 ≥ 4 字 | 空文本无法做校验 |

@@ -22,7 +22,7 @@ paths:
 # S0 -- 元数据预筛 (不解码音频)
 s0:
   min_duration_s: 3.0
-  max_duration_s: 20.0
+  max_duration_s: 30.0
   language: zh
   min_original_dnsmos: 3.2
   min_text_chars: 4

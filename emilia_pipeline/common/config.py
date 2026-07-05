@@ -55,7 +55,7 @@ class S0Config(_Base):
     """Metadata-prefilter gates."""
 
     min_duration_s: float = 3.0
-    max_duration_s: float = 20.0
+    max_duration_s: float = 30.0
     language: str = "zh"
     min_original_dnsmos: float = 3.2
     min_text_chars: int = 4

@@ -1,22 +1,22 @@
 # Pilot 真跑配置 —— 单卡 / 本机路径，派生自 pipeline_v1.yaml (docs/PILOT_RUNBOOK.md §1)
-version: voxsift-emilia-v1.3-pilot
+version: voxsift-emilia-v1.3-full
 schema_version: "1.3"
 
 paths:
-  root: /opt/dlami/nvme/leolxliu/emilia-pilot
-  source: /opt/dlami/nvme/leolxliu/emilia-pilot/source
-  stage: /opt/dlami/nvme/leolxliu/emilia-pilot/stage
-  s0_prefilter: /opt/dlami/nvme/leolxliu/emilia-pilot/stage/s0_prefilter
-  s1_acoustics: /opt/dlami/nvme/leolxliu/emilia-pilot/stage/s1_acoustics
-  s2_prosody: /opt/dlami/nvme/leolxliu/emilia-pilot/stage/s2_prosody
-  s3_speaker_features: /opt/dlami/nvme/leolxliu/emilia-pilot/stage/s3_speaker/features
-  s3_speaker_embeddings: /opt/dlami/nvme/leolxliu/emilia-pilot/stage/s3_speaker/embeddings
-  s4_labels: /opt/dlami/nvme/leolxliu/emilia-pilot/stage/s4_labels
-  repacked: /opt/dlami/nvme/leolxliu/emilia-pilot/repacked
-  manifests: /opt/dlami/nvme/leolxliu/emilia-pilot/manifests
-  done: /opt/dlami/nvme/leolxliu/emilia-pilot/done
-  failed: /opt/dlami/nvme/leolxliu/emilia-pilot/failed
-  export: /opt/dlami/nvme/leolxliu/emilia-pilot/export
+  root: /opt/dlami/nvme/leolxliu/emilia-zh-full
+  source: /opt/dlami/nvme/leolxliu/emilia-zh-full/source
+  stage: /opt/dlami/nvme/leolxliu/emilia-zh-full/stage
+  s0_prefilter: /opt/dlami/nvme/leolxliu/emilia-zh-full/stage/s0_prefilter
+  s1_acoustics: /opt/dlami/nvme/leolxliu/emilia-zh-full/stage/s1_acoustics
+  s2_prosody: /opt/dlami/nvme/leolxliu/emilia-zh-full/stage/s2_prosody
+  s3_speaker_features: /opt/dlami/nvme/leolxliu/emilia-zh-full/stage/s3_speaker/features
+  s3_speaker_embeddings: /opt/dlami/nvme/leolxliu/emilia-zh-full/stage/s3_speaker/embeddings
+  s4_labels: /opt/dlami/nvme/leolxliu/emilia-zh-full/stage/s4_labels
+  repacked: /opt/dlami/nvme/leolxliu/emilia-zh-full/repacked
+  manifests: /opt/dlami/nvme/leolxliu/emilia-zh-full/manifests
+  done: /opt/dlami/nvme/leolxliu/emilia-zh-full/done
+  failed: /opt/dlami/nvme/leolxliu/emilia-zh-full/failed
+  export: /opt/dlami/nvme/leolxliu/emilia-zh-full/export
 
 s0:
   min_duration_s: 3.0
@@ -110,14 +110,14 @@ hf:
 
 models:
   aesthetics_model: audiobox-aesthetics
-  aesthetics_weights: /opt/dlami/nvme/leolxliu/emilia-pilot/weights/audiobox/checkpoint.pt
-  dnsmos_onnx: /opt/dlami/nvme/leolxliu/emilia-pilot/weights/dnsmos/sig_bak_ovr.onnx
+  aesthetics_weights: /opt/dlami/nvme/leolxliu/emilia-zh-full/weights/audiobox/checkpoint.pt
+  dnsmos_onnx: /opt/dlami/nvme/leolxliu/emilia-zh-full/weights/dnsmos/sig_bak_ovr.onnx
   campplus_model: cam++
-  campplus_weights: /opt/dlami/nvme/leolxliu/emilia-pilot/weights/campplus/iic/speech_campplus_sv_zh-cn_16k-common
+  campplus_weights: /opt/dlami/nvme/leolxliu/emilia-zh-full/weights/campplus/iic/speech_campplus_sv_zh-cn_16k-common
 
 runtime:
-  n_gpus: 1
-  total_cores: 64          # 机器上有其他任务在跑, 只用一部分核
+  n_gpus: 8
+  total_cores: 176        # 22 核/worker × 8
   cpu_per_gpu: null
   audio_sample_rate: 24000
   use_mocks: false         # pilot 必须关 mock; 权重路径缺失时会静默回退 mock

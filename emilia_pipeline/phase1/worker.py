@@ -41,6 +41,7 @@ import multiprocessing as mp
 import os
 import tarfile
 import typing
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -591,6 +592,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="run the CPU stage inline (no mp.Pool)",
     )
+    parser.add_argument(
+        "--num-workers", type=int, default=1,
+        help="total number of parallel worker processes (task partitioning)",
+    )
+    parser.add_argument(
+        "--worker-index", type=int, default=0,
+        help="this worker's partition index in [0, num-workers)",
+    )
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
@@ -599,6 +608,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     tasks = enumerate_shard_tasks(source_dir)
     pending = pending_tasks(tasks, PHASE1_STAGE, config.paths.done)
+    if args.num_workers > 1:
+        # Static partition by stable hash: N concurrent workers see disjoint
+        # pending sets, so no shard is ever processed twice (the pending list
+        # is a startup snapshot; skip_if_done alone cannot prevent two workers
+        # from starting the same shard inside its multi-minute window).
+        pending = [
+            s for s in pending
+            if zlib.crc32(s.encode()) % args.num_workers == args.worker_index
+        ]
     if args.limit is not None:
         pending = pending[: args.limit]
 
