@@ -281,6 +281,12 @@ class HFConfig(_Base):
     include_metrics: bool = True
     # Apply the S2 global top-fraction prosody gate when selecting survivors.
     apply_s2_top_fraction: bool = True
+    # Which survivor population to physically publish (tier is always recorded):
+    #   "prime" -- S3-pass AND S2 top-fraction (the legacy publish set)
+    #   "s3"    -- every S3-pass clip (top-fraction becomes metadata only)
+    #   "s1"    -- every S1 survivor, incl. S3-rejected (data/{tier}/ partitions)
+    # None -> derived from ``apply_s2_top_fraction`` for backward compatibility.
+    publish_scope: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import pyarrow as pa
+import soundfile as sf
 
 from ..common import audio as audio_utils
 from ..common.config import Config
@@ -64,7 +65,6 @@ __all__ = [
     "build_meta_json",
     "load_phase1_entries",
     "attach_audio_from_source",
-    "write_shards",
     "build_manifest_rows",
     "write_metrics_parquet",
     "upload_s4_labels",
@@ -86,18 +86,29 @@ class Phase1Entry:
     source_shard: str
     meta_json: dict[str, Any]
     priority_rank: int
+    # Release tier: "prime" (S3-pass + S2 top-fraction), "extended" (S3-pass,
+    # below the cut) or "s3rejected" (S1 survivor rejected by S3). Decides the
+    # data/{tier}/ subdirectory the clip's shard lands in.
+    tier: str = "prime"
     trimmed: bool = False
     trim_start_s: Optional[float] = None
     trim_end_s: Optional[float] = None
     audio_bytes: Optional[bytes] = None
     audio_ext: str = "flac"
+    # Native sample rate of the published audio bytes (probed at attach time;
+    # Emilia-ZH sources mix 24/32/44.1 kHz, audio is never resampled).
+    sample_rate: Optional[int] = None
+    # Sticky "audio was attached" flag: the streaming packager drops
+    # ``audio_bytes`` right after writing each clip to its shard, so this must
+    # survive the bytes themselves for the manifest / metrics parquet.
+    has_audio: bool = False
     # Flat survivor row (every queried metric column) for the top-level
     # ``metadata/phase1_metrics.parquet`` -- the Phase-2 join surface.
     metrics_row: Optional[dict[str, Any]] = None
 
-    @property
-    def has_audio(self) -> bool:
-        return self.audio_bytes is not None
+    def __post_init__(self) -> None:
+        if self.audio_bytes is not None:
+            self.has_audio = True
 
 
 @dataclass
@@ -139,33 +150,50 @@ def _sql_str_list(values: Sequence[str]) -> str:
 
 
 def query_phase1_survivors(
-    config: Config, *, apply_s2_top_fraction: bool = True
+    config: Config,
+    *,
+    apply_s2_top_fraction: bool = True,
+    scope: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Query and priority-order the Phase-1 survivor set with full metrics.
+    """Query and priority-order the Phase-1 publish set with full metrics.
 
-    Same survivor definition and ordering as
-    :func:`emilia_pipeline.phase1.repack.query_survivors` (passed S0 + S1, an
-    eligible S3 verdict, global ``prosody_dsp_score`` top-fraction gate, ordered
-    by ``config.repack.priority_expr`` descending) -- but this projection also
-    carries every S1/S2/S3 metric column so the release meta can embed them.
+    Every row carries a ``tier`` column computed over ALL S1 survivors:
+    ``prime`` (eligible S3 verdict AND ``prosody_dsp_score`` at/above the global
+    top-fraction cut, taken among S3-eligible clips), ``extended`` (eligible
+    verdict, below the cut) or ``s3rejected`` (S1 survivor with a rejecting S3
+    verdict). ``scope`` decides which tiers are returned:
+
+    * ``"prime"`` -- prime only (the legacy publish set)
+    * ``"s3"``    -- prime + extended (every S3-pass clip)
+    * ``"s1"``    -- everything (tiers partition the release)
+
+    Note the z-score population for ``prosody_dsp_score`` is all S1 survivors
+    (exactly the set S2 computed features for), so scores are scope-independent.
 
     Args:
         config: Pipeline config (thresholds + stage paths).
-        apply_s2_top_fraction: Apply the global S2 top-fraction prosody gate.
+        apply_s2_top_fraction: Legacy switch, used only when ``scope`` is None:
+            True -> "prime", False -> "s3".
+        scope: Publish population ("prime" / "s3" / "s1"); overrides the legacy
+            switch when given.
 
     Returns:
         Flat dict rows in priority order, each with ``priority_rank`` assigned.
     """
+    if scope is None:
+        scope = "prime" if apply_s2_top_fraction else "s3"
+    if scope not in ("prime", "s3", "s1"):
+        raise ValueError(f"unknown publish scope: {scope!r}")
+    scope_clause = {
+        "prime": "WHERE tier = 'prime'",
+        "s3": "WHERE s3_eligible",
+        "s1": "",
+    }[scope]
     paths = config.paths
     verdicts = _sql_str_list(config.repack.survivor_verdicts)
     keep_frac = float(config.s2.top_fraction)
     q = max(0.0, min(1.0, 1.0 - keep_frac))
     score_expr = prosody_dsp_score_sql(config.s2.z_weights, column_prefix="s2.")
-    top_clause = (
-        f"WHERE prosody_dsp_score >= (SELECT quantile_cont(prosody_dsp_score, {q}) FROM scored)"
-        if apply_s2_top_fraction
-        else ""
-    )
     priority_expr = config.repack.priority_expr
 
     s1_cols = ", ".join(f"s1.{m} AS {m}" for m in _S1_METRICS)
@@ -191,19 +219,29 @@ def query_phase1_survivors(
             {s1_cols},
             {s2_cols},
             {s3_cols},
+            (s3.verdict IN ({verdicts})) AS s3_eligible,
             {score_expr}          AS prosody_dsp_score
         FROM s0
         JOIN s1 ON s0.clip_id = s1.clip_id
         JOIN s2 ON s0.clip_id = s2.clip_id
         JOIN s3 ON s0.clip_id = s3.clip_id
-        WHERE s0.passed AND s1.passed AND s3.verdict IN ({verdicts})
+        WHERE s0.passed AND s1.passed
+    ),
+    cut AS (
+        SELECT quantile_cont(prosody_dsp_score, {q}) AS score_cut
+        FROM base WHERE s3_eligible
     ),
     scored AS (
-        SELECT * FROM base
+        SELECT
+            base.*,
+            CASE WHEN NOT base.s3_eligible THEN 's3rejected'
+                 WHEN base.prosody_dsp_score >= cut.score_cut THEN 'prime'
+                 ELSE 'extended' END AS tier
+        FROM base, cut
     ),
     kept AS (
         SELECT * FROM scored
-        {top_clause}
+        {scope_clause}
     ),
     bounds AS (
         SELECT min(aes_pq) AS min_pq, max(aes_pq) AS max_pq FROM kept
@@ -269,6 +307,7 @@ def build_meta_json(
         "speaker": str(row.get("original_speaker", "") or ""),
         "language": str(row.get("original_language", "") or ""),
         "duration_s": dur,
+        "tier": str(row.get("tier", "prime")),
         "purity": {
             "verdict": str(row.get("verdict", "")),
             "trimmed": bool(row.get("trimmed", False)),
@@ -297,21 +336,30 @@ def build_meta_json(
 
 
 def load_phase1_entries(
-    config: Config, *, apply_s2_top_fraction: bool = True, include_metrics: bool = True
+    config: Config,
+    *,
+    apply_s2_top_fraction: bool = True,
+    include_metrics: bool = True,
+    scope: Optional[str] = None,
 ) -> list[Phase1Entry]:
     """Load Phase-1 survivors as :class:`Phase1Entry` (no audio bytes yet)."""
     rows = query_phase1_survivors(
-        config, apply_s2_top_fraction=apply_s2_top_fraction
+        config, apply_s2_top_fraction=apply_s2_top_fraction, scope=scope
     )
     entries: list[Phase1Entry] = []
     for row in rows:
+        tier = str(row.get("tier", "prime"))
+        # S3-rejected clips ship verbatim: their S3 trim bounds are exactly the
+        # judgement being second-guessed, so no destructive trim is applied.
+        trimmed = bool(row.get("trimmed", False)) and tier != "s3rejected"
         entries.append(
             Phase1Entry(
                 clip_id=str(row["clip_id"]),
                 source_shard=str(row.get("source_shard", "")),
                 meta_json=build_meta_json(row, config, include_metrics=include_metrics),
                 priority_rank=int(row.get("priority_rank", 0)),
-                trimmed=bool(row.get("trimmed", False)),
+                tier=tier,
+                trimmed=trimmed,
                 trim_start_s=_f(row.get("trim_start_s")),
                 trim_end_s=_f(row.get("trim_end_s")),
                 metrics_row=row,
@@ -372,8 +420,18 @@ def attach_audio_from_source(entries: Sequence[Phase1Entry], config: Config) -> 
                     raw, ext = _apply_trim(raw, e.trim_start_s, e.trim_end_s)
                 e.audio_bytes = raw
                 e.audio_ext = ext
+                e.has_audio = True
+                e.sample_rate = _probe_sample_rate(raw)
                 attached += 1
     return attached
+
+
+def _probe_sample_rate(audio_bytes: bytes) -> Optional[int]:
+    """Header-probe the native sample rate of encoded audio bytes."""
+    try:
+        return int(sf.info(io.BytesIO(audio_bytes)).samplerate)
+    except Exception:
+        return None
 
 
 def _apply_trim(
@@ -396,62 +454,67 @@ def _entry_nbytes(entry: Phase1Entry) -> int:
     return meta_size + (len(entry.audio_bytes) if entry.audio_bytes else 0)
 
 
-def write_shards(
-    entries: Sequence[Phase1Entry],
-    export_dir: Path,
-    *,
-    target_shard_bytes: int,
-    shard_prefix: str = "shard",
-) -> list[Path]:
-    """Write entries to WebDataset tar shards under ``export_dir/data``.
+class _RollingShardWriter:
+    """Rolling WebDataset tar writer for one ``data/{tier}/`` subdirectory.
 
-    Each clip contributes ``{clip_id}.{ext}`` (audio, when present) and
-    ``{clip_id}.json`` (meta). Shards roll over when the accumulated size exceeds
-    ``target_shard_bytes``. Written atomically via ``*.tmp`` + rename.
-
-    Returns:
-        The list of shard paths written, in order.
+    Streaming counterpart of the old whole-set ``write_shards``: clips are
+    appended one at a time (so audio bytes never accumulate in memory), shards
+    roll over past ``target_shard_bytes``, and each tar is written atomically
+    via ``*.tmp`` + rename. ``add`` returns the release-shard name recorded in
+    the manifest (``{tier}/{prefix}-NNNNN.tar``).
     """
-    data_dir = export_dir / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    shard_paths: list[Path] = []
-    shard_idx = 0
-    cur: Optional[tarfile.TarFile] = None
-    cur_tmp: Optional[Path] = None
-    cur_final: Optional[Path] = None
-    cur_bytes = 0
 
-    def _open() -> None:
-        nonlocal cur, cur_tmp, cur_final, cur_bytes
-        final = data_dir / f"{shard_prefix}-{shard_idx:05d}.tar"
-        tmp = final.with_name(final.name + ".tmp")
-        cur = tarfile.open(tmp, "w")
-        cur_tmp, cur_final, cur_bytes = tmp, final, 0
+    def __init__(
+        self,
+        export_dir: Path,
+        tier: str,
+        *,
+        target_shard_bytes: int,
+        shard_prefix: str = "shard",
+    ) -> None:
+        self.data_dir = export_dir / "data" / tier
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.tier = tier
+        self.cap = target_shard_bytes
+        self.prefix = shard_prefix
+        self.shard_paths: list[Path] = []
+        self._idx = 0
+        self._cur: Optional[tarfile.TarFile] = None
+        self._tmp: Optional[Path] = None
+        self._final: Optional[Path] = None
+        self._bytes = 0
 
-    def _close() -> None:
-        nonlocal cur, cur_tmp, cur_final
-        if cur is None:
+    def _open(self) -> None:
+        self._final = self.data_dir / f"{self.prefix}-{self._idx:05d}.tar"
+        self._tmp = self._final.with_name(self._final.name + ".tmp")
+        self._cur = tarfile.open(self._tmp, "w")
+        self._bytes = 0
+
+    def _close_current(self) -> None:
+        if self._cur is None:
             return
-        cur.close()
-        os.replace(cur_tmp, cur_final)
-        shard_paths.append(cur_final)
-        cur = None
+        self._cur.close()
+        os.replace(self._tmp, self._final)
+        self.shard_paths.append(self._final)
+        self._cur = None
 
-    _open()
-    for entry in entries:
-        if cur is None:
-            _open()
+    def add(self, entry: Phase1Entry) -> str:
+        if self._cur is None:
+            self._open()
         if entry.audio_bytes is not None:
-            _add_member(cur, f"{entry.clip_id}.{entry.audio_ext}", entry.audio_bytes)
+            _add_member(self._cur, f"{entry.clip_id}.{entry.audio_ext}", entry.audio_bytes)
         meta_bytes = json.dumps(entry.meta_json, ensure_ascii=False).encode("utf-8")
-        _add_member(cur, f"{entry.clip_id}.json", meta_bytes)
-        cur_bytes += _entry_nbytes(entry)
-        if cur_bytes >= target_shard_bytes:
-            _close()
-            shard_idx += 1
-            _open()
-    _close()
-    return shard_paths
+        _add_member(self._cur, f"{entry.clip_id}.json", meta_bytes)
+        self._bytes += _entry_nbytes(entry)
+        name = f"{self.tier}/{self._final.name}"
+        if self._bytes >= self.cap:
+            self._close_current()
+            self._idx += 1
+        return name
+
+    def close(self) -> list[Path]:
+        self._close_current()
+        return self.shard_paths
 
 
 # ---------------------------------------------------------------------------
@@ -463,8 +526,10 @@ _MANIFEST_SCHEMA = pa.schema(
         ("clip_id", pa.string()),
         ("source_shard", pa.string()),
         ("shard", pa.string()),
+        ("tier", pa.string()),
         ("has_audio", pa.bool_()),
         ("audio_ext", pa.string()),
+        ("sample_rate", pa.int32()),
         ("speaker", pa.string()),
         ("verdict", pa.string()),
         ("duration_s", pa.float64()),
@@ -486,8 +551,10 @@ def build_manifest_rows(
                 "clip_id": e.clip_id,
                 "source_shard": e.source_shard,
                 "shard": shard_assignment.get(e.clip_id, ""),
+                "tier": e.tier,
                 "has_audio": e.has_audio,
                 "audio_ext": e.audio_ext,
+                "sample_rate": e.sample_rate,
                 "speaker": str(e.meta_json.get("speaker", "")),
                 "verdict": str(purity.get("verdict", "")),
                 "duration_s": _f(e.meta_json.get("duration_s")) or 0.0,
@@ -498,9 +565,25 @@ def build_manifest_rows(
     return rows
 
 
-def _dataset_card(config: Config, result_n: int, n_audio: int) -> str:
+def _dataset_card(
+    config: Config,
+    result_n: int,
+    n_audio: int,
+    tier_counts: Optional[dict[str, int]] = None,
+) -> str:
     """Render a minimal dataset card (README.md) describing the filtered subset."""
     s0, s1 = config.s0, config.s1
+    tc = tier_counts or {}
+    keep_pct = int(config.s2.top_fraction * 100)
+    verdicts = ", ".join(config.repack.survivor_verdicts)
+    tier_rows = "\n".join(
+        f"| `{t}` | {desc} | {tc.get(t, 0):,} |"
+        for t, desc in (
+            ("prime", f"S3 speaker-purity pass ({verdicts}) AND `prosody_dsp_score` in the global top {keep_pct}% of S3-pass clips — the curated expressive core"),
+            ("extended", f"S3 pass, below the top-{keep_pct}% prosody cut — clean but prosodically flatter"),
+            ("s3rejected", "S1-pass but rejected by S3 sliding-window purity (possible speaker intrusion / degradation); shipped verbatim, no trim, use at your own risk"),
+        )
+    )
     return f"""---
 license: cc-by-nc-4.0
 task_categories:
@@ -518,41 +601,59 @@ tags:
 # Emilia Expressive — Phase-1 Filtered Subset
 
 Auto-generated by `emilia_pipeline.scoring.phase1_hf`. This is the **Phase-1
-filtered** view: clips that survived the S0-S3 acoustic / prosody / speaker-purity
-funnel, **before** Phase-2 emotion labeling. The fully-labeled release lives in
-the same repo on a different revision.
+filtered** view: every clip that survived the S0+S1 acoustic funnel, physically
+partitioned into quality **tiers** so you can download exactly the strictness
+level you want -- **before** Phase-2 emotion labeling.
 
 Derived from [amphion/Emilia-Dataset](https://huggingface.co/datasets/amphion/Emilia-Dataset)
 (CC-BY-NC-4.0); the same license and usage restrictions apply.
 
 - **Pipeline version:** `{config.version}` (schema `{config.schema_version}`)
-- **Clips:** {result_n} ({n_audio} with audio)
-- **Format:** WebDataset tar shards under `data/`; each clip is
-  `{{clip_id}}.flac` + `{{clip_id}}.json`.
+- **Clips:** {result_n:,} ({n_audio:,} with audio)
+- **Format:** WebDataset tar shards under `data/{{tier}}/`; each clip is
+  `{{clip_id}}.mp3|flac` + `{{clip_id}}.json`. Audio keeps its **original
+  sample rate** (Emilia-ZH mixes 24/32/44.1 kHz -- see the `sample_rate`
+  metadata column); it is never resampled by the pipeline.
 - **Metadata:** `metadata/phase1_metrics.parquet` -- one flat row per clip
-  (full S0-S3 metrics, keyed by `clip_id`). Phase-2 emotion/prosody labels are
-  published incrementally as `metadata/s4_labels.parquet` with the same key;
-  audio tars are never rewritten.
+  (full S0-S3 metrics + `tier` + `sample_rate`, keyed by `clip_id`). Phase-2
+  emotion/prosody labels are published incrementally as
+  `metadata/s4_labels.parquet` with the same key; audio tars are never rewritten.
 
-## Filtering funnel
+## Tiers: pick your filtering level
+
+| Tier | Selection rule | Clips |
+|------|----------------|-------|
+{tier_rows}
+
+Rules of thumb:
+
+- **Just want the best expressive TTS data** -> download `data/prime/` only.
+- **Want more hours, still clean** -> `data/prime/` + `data/extended/`, then
+  optionally re-cut by `prosody_dsp_score` yourself.
+- **Custom funnel** -> take all tiers and filter on
+  `metadata/phase1_metrics.parquet`: every S0-S3 metric is a column, so any
+  stricter (or looser) gate is a parquet query, no repacking needed.
+
+## Filtering funnel (applied upstream of the tiers)
 
 | Stage | What it does |
 |-------|--------------|
 | S0 | Metadata prefilter: {s0.min_duration_s}-{s0.max_duration_s}s, lang=`{s0.language}`, original DNSMOS ≥ {s0.min_original_dnsmos}, text ≥ {s0.min_text_chars} chars |
 | S1 | Acoustic gate: aes_pq ≥ {s1.min_aes_pq}, aes_pc ≤ {s1.max_aes_pc}, aes_ce ≥ {s1.min_aes_ce}, SNR ≥ {s1.min_snr_db} dB, bandwidth ≥ {s1.min_bandwidth_hz} Hz |
-| S2 | Prosody richness (top {int(config.s2.top_fraction * 100)}% by `prosody_dsp_score`) |
-| S3 | Sliding-window speaker purity (verdicts: {", ".join(config.repack.survivor_verdicts)}) |
+| S2 | Prosody richness score (`prosody_dsp_score`, z-scored over all S1 survivors); the top {keep_pct}% cut among S3-pass clips defines `prime` |
+| S3 | Sliding-window speaker purity; pass verdicts ({verdicts}) split `prime`/`extended`, the rest -> `s3rejected` |
 
 Clips are ordered by labeling priority (`{config.repack.priority_expr}`); the
 `priority_rank` field preserves that order. `intruded_trimmed` clips ship
-head/tail-trimmed audio matching their advertised duration.
+head/tail-trimmed audio matching their advertised duration (`s3rejected` audio
+is always verbatim).
 
 ## Per-clip JSON schema
 
 Identity (`clip_id`, `source_shard`, `text`, `speaker`, `language`,
-`duration_s`), `purity` (verdict + trim bounds + gender), and labeling `priority`
-are always present. When packaged with `include_metrics`, a `metrics` block
-carries the full S0-S3 acoustics + prosody numbers.
+`duration_s`), `tier`, `purity` (verdict + trim bounds + gender), and labeling
+`priority` are always present. When packaged with `include_metrics`, a
+`metrics` block carries the full S0-S3 acoustics + prosody numbers.
 """
 
 
@@ -571,19 +672,31 @@ def package_phase1(
     seed: int = 1234,
     entries: Optional[Sequence[Phase1Entry]] = None,
     mark_done: bool = True,
+    scope: Optional[str] = None,
 ) -> Phase1PackResult:
-    """Produce the Phase-1 filtered release folder (shards + manifest + card).
+    """Produce the Phase-1 release folder (tiered shards + manifest + card).
+
+    Shards are partitioned by tier under ``data/{tier}/``. Audio is attached
+    and written *streaming*, one source shard at a time, so peak memory stays
+    around a single source tar regardless of publish scope. The write order is
+    a seeded shuffle of the entry list grouped by source shard (source-shard
+    visiting order and within-shard order are both decorrelated; use a
+    WebDataset shuffle buffer downstream for full mixing).
 
     Args:
         config: Pipeline config (``hf`` block supplies defaults).
-        apply_s2_top_fraction: Override ``hf.apply_s2_top_fraction``.
+        apply_s2_top_fraction: Override ``hf.apply_s2_top_fraction`` (legacy
+            scope switch, used only when ``scope``/``hf.publish_scope`` unset).
         include_metrics: Override ``hf.include_metrics``.
         target_shard_bytes: Override ``hf.shard_bytes``.
         shuffle: Deterministically shuffle entries so shard order decorrelates
             from speaker (default True; set False to keep strict priority order).
         seed: Shuffle seed.
-        entries: Pre-built entries (skips loading from disk; used by tests).
+        entries: Pre-built entries with audio already attached (skips loading
+            from disk; used by tests). Written directly, no streaming.
         mark_done: Write the ``pack/phase1`` done marker after the manifest lands.
+        scope: Publish population ("prime" / "s3" / "s1"); default
+            ``hf.publish_scope``, falling back to the legacy switch.
 
     Returns:
         A populated :class:`Phase1PackResult`.
@@ -597,19 +710,52 @@ def package_phase1(
         config.hf.include_metrics if include_metrics is None else include_metrics
     )
     cap = target_shard_bytes or config.hf.shard_bytes
+    publish_scope = scope or config.hf.publish_scope or ("prime" if apply_top else "s3")
 
     export_dir = Path(config.paths.export) / EXPORT_SUBDIR
+    prefetched = entries is not None
     if entries is None:
         entries = load_phase1_entries(
-            config, apply_s2_top_fraction=apply_top, include_metrics=inc_metrics
+            config, include_metrics=inc_metrics, scope=publish_scope
         )
-        attach_audio_from_source(entries, config)
     entries = list(entries)
-
     ordered = shuffle_entries(entries, seed=seed) if shuffle else entries
-    shard_paths = write_shards(ordered, export_dir, target_shard_bytes=cap)
 
-    shard_assignment = _replay_shard_assignment(ordered, cap, shard_paths)
+    writers: dict[str, _RollingShardWriter] = {}
+    shard_assignment: dict[str, str] = {}
+
+    def _writer(tier: str) -> _RollingShardWriter:
+        if tier not in writers:
+            writers[tier] = _RollingShardWriter(
+                export_dir, tier, target_shard_bytes=cap
+            )
+        return writers[tier]
+
+    if prefetched:
+        for e in ordered:
+            shard_assignment[e.clip_id] = _writer(e.tier).add(e)
+    else:
+        # Stream: group the (already shuffled) order by source shard, attach
+        # one source tar's audio at a time, write, then drop the bytes.
+        by_shard: dict[str, list[Phase1Entry]] = {}
+        for e in ordered:
+            by_shard.setdefault(e.source_shard, []).append(e)
+        for i, (shard, shard_entries) in enumerate(by_shard.items(), 1):
+            attach_audio_from_source(shard_entries, config)
+            for e in shard_entries:
+                shard_assignment[e.clip_id] = _writer(e.tier).add(e)
+                e.audio_bytes = None  # has_audio / sample_rate persist
+            if i % 25 == 0 or i == len(by_shard):
+                print(
+                    f"[package] source shards {i}/{len(by_shard)}, "
+                    f"{len(shard_assignment)} clips written",
+                    flush=True,
+                )
+
+    shard_paths: list[Path] = []
+    for w in writers.values():
+        shard_paths.extend(w.close())
+
     manifest_rows = build_manifest_rows(ordered, shard_assignment)
     manifest_path = export_dir / "phase1_manifest_v1.parquet"
     table = (
@@ -625,8 +771,11 @@ def package_phase1(
     write_metrics_parquet(ordered, shard_assignment, config, export_dir)
 
     n_audio = sum(1 for e in ordered if e.has_audio)
+    tier_counts: dict[str, int] = {}
+    for e in ordered:
+        tier_counts[e.tier] = tier_counts.get(e.tier, 0) + 1
     (export_dir / "README.md").write_text(
-        _dataset_card(config, len(ordered), n_audio), encoding="utf-8"
+        _dataset_card(config, len(ordered), n_audio, tier_counts), encoding="utf-8"
     )
 
     result = Phase1PackResult(
@@ -661,8 +810,10 @@ def write_metrics_parquet(
             continue
         row = dict(e.metrics_row)
         row["shard"] = shard_assignment.get(e.clip_id, "")
+        row["tier"] = e.tier
         row["has_audio"] = e.has_audio
         row["audio_ext"] = e.audio_ext
+        row["sample_rate"] = e.sample_rate
         row["pipeline_version"] = config.version
         row["schema_version"] = config.schema_version
         rows.append(row)
@@ -725,27 +876,6 @@ def upload_s4_labels(
         return path, None
     except Exception as exc:  # pragma: no cover - network path
         return path, f"upload failed: {exc}"
-
-
-def _replay_shard_assignment(
-    entries: Sequence[Phase1Entry], cap: int, shard_paths: Sequence[Path]
-) -> dict[str, str]:
-    """Recompute which shard each clip landed in (mirrors write_shards rollover)."""
-    assignment: dict[str, str] = {}
-    if not shard_paths:
-        return assignment
-    idx = 0
-    cur_bytes = 0
-    names = [p.name for p in shard_paths]
-    for e in entries:
-        if idx >= len(names):
-            idx = len(names) - 1
-        assignment[e.clip_id] = names[idx]
-        cur_bytes += _entry_nbytes(e)
-        if cur_bytes >= cap:
-            idx += 1
-            cur_bytes = 0
-    return assignment
 
 
 def upload_phase1_to_hf(
