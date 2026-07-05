@@ -27,6 +27,10 @@ mkdir -p "$LOGDIR"
 for g in $(seq 0 $((N - 1))); do
   setsid nohup bash -c "
     cd '$ROOT'
+    # Cap BLAS/OMP threads: without this every worker (and each of its pool
+    # children) spawns nproc-wide thread teams -> 8-way oversubscription that
+    # made the first full-scale pass ~5x slower per shard.
+    export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4
     while true; do
       CUDA_VISIBLE_DEVICES=$g '$PY' -m emilia_pipeline.phase1.worker \
         --config '$CFG' --num-workers $N --worker-index $g \
