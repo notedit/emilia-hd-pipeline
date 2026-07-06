@@ -18,7 +18,7 @@ Data sources (self-contained -- no dependency on ``run_repack``):
     head/tail trim is applied inline (mirroring :func:`repack.repack_slice`), so
     the released audio matches the advertised trimmed duration / verdict.
 
-Each clip contributes ``{clip_id}.flac`` (audio) + ``{clip_id}.json`` (a rich
+Each clip contributes ``{clip_id}.mp3`` (audio) + ``{clip_id}.json`` (a rich
 meta record carrying the full S0-S3 metric block when ``hf.include_metrics``).
 Entries are deterministically shuffled so shard order decorrelates from speaker.
 Upload uses ``huggingface_hub.upload_large_folder`` and is a graceful no-op when
@@ -94,7 +94,7 @@ class Phase1Entry:
     trim_start_s: Optional[float] = None
     trim_end_s: Optional[float] = None
     audio_bytes: Optional[bytes] = None
-    audio_ext: str = "flac"
+    audio_ext: str = "mp3"
     # Native sample rate of the published audio bytes (probed at attach time;
     # Emilia-ZH sources mix 24/32/44.1 kHz, audio is never resampled).
     sample_rate: Optional[int] = None
@@ -387,7 +387,7 @@ def attach_audio_from_source(entries: Sequence[Phase1Entry], config: Config) -> 
 
     Groups clips by ``source_shard`` so each tar is opened once and read
     sequentially. ``intruded_trimmed`` clips are decoded, sliced to their kept
-    ``[trim_start_s, trim_end_s)`` span, and re-encoded to FLAC (mirroring
+    ``[trim_start_s, trim_end_s)`` span, and re-encoded to MP3 (mirroring
     :func:`emilia_pipeline.phase1.repack.repack_slice`); everyone else is copied
     verbatim. Missing shards / members leave ``audio_bytes=None`` (still packaged,
     meta-only, so a gap is explicit rather than silent).
@@ -437,10 +437,19 @@ def _probe_sample_rate(audio_bytes: bytes) -> Optional[int]:
 def _apply_trim(
     audio_bytes: bytes, trim_start_s: float, trim_end_s: Optional[float]
 ) -> tuple[bytes, str]:
-    """Decode, slice to ``[start, end)``, re-encode to FLAC (returns bytes, ext)."""
+    """Decode, slice to ``[start, end)``, re-encode to MP3 (returns bytes, ext).
+
+    MP3 (lame VBR highest quality, ~76kbps vs the ~49kbps sources) rather than
+    FLAC so every release shard is codec-homogeneous: mixed mp3/flac members
+    break ``datasets.load_dataset("webdataset")``, and the sources are lossy
+    MP3 to begin with.
+    """
     arr, sr = audio_utils.decode_bytes(audio_bytes)
     trimmed = audio_utils.trim_segment(arr, sr, trim_start_s, trim_end_s)
-    return audio_utils.encode_audio(trimmed, sr, fmt="FLAC"), "flac"
+    encoded = audio_utils.encode_audio(
+        trimmed, sr, fmt="MP3", bitrate_mode="VARIABLE", compression_level=0.0
+    )
+    return encoded, "mp3"
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +524,54 @@ class _RollingShardWriter:
     def close(self) -> list[Path]:
         self._close_current()
         return self.shard_paths
+
+
+def _pack_worker(
+    worker_id: int,
+    shard_names: Sequence[str],
+    by_shard: dict[str, list[Phase1Entry]],
+    config: Config,
+    export_dir: Path,
+    cap: int,
+    out_queue: Any,
+) -> None:
+    """Child body of the parallel streaming packager (fork-started).
+
+    Streams its assigned source shards exactly like the sequential path, but
+    writes release shards under a per-worker prefix (``shard-wNN-...``) so
+    writers never collide. Ships back ``clip_id -> (release shard, has_audio,
+    audio_ext, sample_rate)`` -- the fields the parent needs for the manifest /
+    metrics parquet, since child-side entry mutations die with the fork.
+    """
+    try:
+        writers: dict[str, _RollingShardWriter] = {}
+        results: dict[str, tuple[str, bool, str, Optional[int]]] = {}
+        for i, shard in enumerate(shard_names, 1):
+            shard_entries = by_shard[shard]
+            attach_audio_from_source(shard_entries, config)
+            for e in shard_entries:
+                w = writers.get(e.tier)
+                if w is None:
+                    w = writers[e.tier] = _RollingShardWriter(
+                        export_dir,
+                        e.tier,
+                        target_shard_bytes=cap,
+                        shard_prefix=f"shard-w{worker_id:02d}",
+                    )
+                name = w.add(e)
+                results[e.clip_id] = (name, e.has_audio, e.audio_ext, e.sample_rate)
+                e.audio_bytes = None
+            if i % 10 == 0 or i == len(shard_names):
+                print(
+                    f"[package] w{worker_id:02d}: {i}/{len(shard_names)} source shards",
+                    flush=True,
+                )
+        paths = [str(p) for w in writers.values() for p in w.close()]
+        out_queue.put(("ok", results, paths))
+    except BaseException as exc:  # noqa: BLE001 - relayed to the parent
+        import traceback
+
+        out_queue.put(("error", f"{exc}\n{traceback.format_exc()}", []))
 
 
 # ---------------------------------------------------------------------------
@@ -611,9 +668,10 @@ Derived from [amphion/Emilia-Dataset](https://huggingface.co/datasets/amphion/Em
 - **Pipeline version:** `{config.version}` (schema `{config.schema_version}`)
 - **Clips:** {result_n:,} ({n_audio:,} with audio)
 - **Format:** WebDataset tar shards under `data/{{tier}}/`; each clip is
-  `{{clip_id}}.mp3|flac` + `{{clip_id}}.json`. Audio keeps its **original
-  sample rate** (Emilia-ZH mixes 24/32/44.1 kHz -- see the `sample_rate`
-  metadata column); it is never resampled by the pipeline.
+  `{{clip_id}}.mp3` + `{{clip_id}}.json` (loadable with
+  `datasets.load_dataset("webdataset", ...)` or the `webdataset` library).
+  Audio keeps its **original sample rate** (Emilia-ZH mixes 24/32/44.1 kHz --
+  see the `sample_rate` metadata column); it is never resampled by the pipeline.
 - **Metadata:** `metadata/phase1_metrics.parquet` -- one flat row per clip
   (full S0-S3 metrics + `tier` + `sample_rate`, keyed by `clip_id`). Phase-2
   emotion/prosody labels are published incrementally as
@@ -645,8 +703,9 @@ Rules of thumb:
 
 Clips are ordered by labeling priority (`{config.repack.priority_expr}`); the
 `priority_rank` field preserves that order. `intruded_trimmed` clips ship
-head/tail-trimmed audio matching their advertised duration (`s3rejected` audio
-is always verbatim).
+head/tail-trimmed audio matching their advertised duration, re-encoded as
+high-quality VBR MP3 (all other audio is the verbatim source bytes;
+`s3rejected` audio is always verbatim).
 
 ## Per-clip JSON schema
 
@@ -731,6 +790,7 @@ def package_phase1(
             )
         return writers[tier]
 
+    parallel_shard_paths: list[Path] = []
     if prefetched:
         for e in ordered:
             shard_assignment[e.clip_id] = _writer(e.tier).add(e)
@@ -740,21 +800,68 @@ def package_phase1(
         by_shard: dict[str, list[Phase1Entry]] = {}
         for e in ordered:
             by_shard.setdefault(e.source_shard, []).append(e)
-        for i, (shard, shard_entries) in enumerate(by_shard.items(), 1):
-            attach_audio_from_source(shard_entries, config)
-            for e in shard_entries:
-                shard_assignment[e.clip_id] = _writer(e.tier).add(e)
-                e.audio_bytes = None  # has_audio / sample_rate persist
-            if i % 25 == 0 or i == len(by_shard):
-                print(
-                    f"[package] source shards {i}/{len(by_shard)}, "
-                    f"{len(shard_assignment)} clips written",
-                    flush=True,
+        n_workers = min(int(config.hf.pack_workers or 1), max(1, len(by_shard)))
+        if n_workers <= 1:
+            for i, (shard, shard_entries) in enumerate(by_shard.items(), 1):
+                attach_audio_from_source(shard_entries, config)
+                for e in shard_entries:
+                    shard_assignment[e.clip_id] = _writer(e.tier).add(e)
+                    e.audio_bytes = None  # has_audio / sample_rate persist
+                if i % 25 == 0 or i == len(by_shard):
+                    print(
+                        f"[package] source shards {i}/{len(by_shard)}, "
+                        f"{len(shard_assignment)} clips written",
+                        flush=True,
+                    )
+        else:
+            # Fan out over source shards. Fork start method so children inherit
+            # the (large) entry list copy-on-write instead of pickling it; this
+            # step never touches CUDA, so fork is safe here.
+            import multiprocessing as mp
+
+            ctx = mp.get_context("fork")
+            queue = ctx.SimpleQueue()
+            names = list(by_shard)
+            procs = [
+                ctx.Process(
+                    target=_pack_worker,
+                    args=(k, names[k::n_workers], by_shard, config, export_dir, cap, queue),
+                    daemon=True,
                 )
+                for k in range(n_workers)
+            ]
+            for p in procs:
+                p.start()
+            print(f"[package] {n_workers} workers over {len(by_shard)} source shards", flush=True)
+            errors: list[str] = []
+            merged: dict[str, tuple[str, bool, str, Optional[int]]] = {}
+            for _ in procs:
+                status, payload, paths = queue.get()
+                if status != "ok":
+                    errors.append(str(payload))
+                    continue
+                merged.update(payload)
+                parallel_shard_paths.extend(Path(s) for s in paths)
+            for p in procs:
+                p.join()
+            if errors:
+                raise RuntimeError(f"packaging worker failed:\n{errors[0]}")
+            # Child-side entry mutations died with the fork; replay them here so
+            # the manifest / metrics parquet see attach results.
+            for e in ordered:
+                r = merged.get(e.clip_id)
+                if r is None:
+                    continue
+                shard_assignment[e.clip_id] = r[0]
+                e.has_audio = r[1]
+                e.audio_ext = r[2]
+                e.sample_rate = r[3]
 
     shard_paths: list[Path] = []
     for w in writers.values():
         shard_paths.extend(w.close())
+    shard_paths.extend(parallel_shard_paths)
+    shard_paths.sort()
 
     manifest_rows = build_manifest_rows(ordered, shard_assignment)
     manifest_path = export_dir / "phase1_manifest_v1.parquet"

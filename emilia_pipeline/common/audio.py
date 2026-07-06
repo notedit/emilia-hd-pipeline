@@ -10,7 +10,7 @@ from __future__ import annotations
 import io
 import tarfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -137,7 +137,7 @@ def trim_segment(
     return np.ascontiguousarray(arr[start:stop], dtype=np.float32)
 
 
-def encode_audio(arr: np.ndarray, sr: int, fmt: str = "FLAC") -> bytes:
+def encode_audio(arr: np.ndarray, sr: int, fmt: str = "FLAC", **sf_kwargs: Any) -> bytes:
     """Encode a float32 mono signal to compressed audio bytes.
 
     Used by repack to re-emit trimmed clips (``intruded_trimmed``) whose audio
@@ -148,6 +148,8 @@ def encode_audio(arr: np.ndarray, sr: int, fmt: str = "FLAC") -> bytes:
         arr: float32 mono samples in ``[-1, 1]``.
         sr: Sample rate in Hz.
         fmt: soundfile format string (default ``"FLAC"``).
+        **sf_kwargs: Extra ``soundfile.write`` options (e.g. ``bitrate_mode`` /
+            ``compression_level`` for MP3 quality).
 
     Returns:
         Encoded audio bytes.
@@ -157,7 +159,7 @@ def encode_audio(arr: np.ndarray, sr: int, fmt: str = "FLAC") -> bytes:
     import soundfile as sf
 
     buf = io.BytesIO()
-    sf.write(buf, np.asarray(arr, dtype=np.float32), sr, format=fmt)
+    sf.write(buf, np.asarray(arr, dtype=np.float32), sr, format=fmt, **sf_kwargs)
     return buf.getvalue()
 
 

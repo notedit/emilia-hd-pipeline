@@ -287,6 +287,9 @@ class HFConfig(_Base):
     #   "s1"    -- every S1 survivor, incl. S3-rejected (data/{tier}/ partitions)
     # None -> derived from ``apply_s2_top_fraction`` for backward compatibility.
     publish_scope: Optional[str] = None
+    # Parallel packaging workers (fork-started, one open source tar each).
+    # 1 = the original single-process streaming path.
+    pack_workers: int = 1
 
 
 # ---------------------------------------------------------------------------

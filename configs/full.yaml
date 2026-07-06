@@ -110,6 +110,7 @@ hf:
   # 方案 C (2026-07-05): publish every S1 survivor, tier-partitioned under
   # data/{prime,extended,s3rejected}/ -- looser cuts stay SQL-replayable.
   publish_scope: s1
+  pack_workers: 16
 
 models:
   aesthetics_model: audiobox-aesthetics
