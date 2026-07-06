@@ -17,7 +17,7 @@
 （`shard-wNN-*` 的 `wNN` 是并行打包 worker 编号，无语义）。全库统一 mp3：
 原样 clip 是 Emilia 源字节，S3 修剪过的 clip（约 12%）以高码率 VBR mp3 重编码。
 音频保留**原始采样率**（混采 24/32/44.1 kHz，训练前自行统一重采样）。JSON 含
-`text / duration / speaker / tier` 等字段。
+`text / duration_s / speaker / tier` 及嵌套的 `metrics` 等字段。
 
 > 打包是流式进行的：`data/*/shard-*.tar` 落盘一个可用一个（写入是 tmp+rename
 > 原子操作，看到的 tar 一定是完整的）；两个 parquet 在最后才生成。
@@ -92,6 +92,7 @@ ids = duckdb.sql(f"""
 """).df()
 
 # clip_id → 所在 tar, 用 manifest 反查, 只读命中的 shard
+# (shard 列是相对 data/ 的路径, 如 "prime/shard-w00-00000.tar")
 duckdb.sql(f"""
     SELECT shard, count(*) FROM '{ROOT}/phase1_manifest_v1.parquet'
     WHERE clip_id IN (SELECT clip_id FROM '{M}' WHERE aes_pq >= 7.5)
